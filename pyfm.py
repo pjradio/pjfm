@@ -224,19 +224,18 @@ class SpectrumAnalyzer:
             else:
                 self.peaks[i] = max(0, self.peaks[i] - self.peak_decay)
 
-    def render(self, width, height=8):
+    def render(self, height=8):
         """
         Render spectrum as rich Text with colored bars.
 
         Args:
-            width: Available width in characters
             height: Height in rows
 
         Returns:
             List of rich Text objects, one per row (top to bottom)
         """
-        # Calculate bar width (with spacing)
-        bar_width = max(1, (width - self.NUM_BANDS + 1) // self.NUM_BANDS)
+        # Fixed 2-char wide bars for consistent appearance
+        bar_width = 2
         total_steps = height * 8  # 8 sub-steps per row using block characters
 
         rows = []
@@ -1250,11 +1249,9 @@ def build_display(radio, width=80):
     content = Table.grid(expand=True)
     content.add_row(Align.center(table))
 
-    # Spectrum analyzer display
+    # Spectrum analyzer display (fixed 2-char wide bars, centered)
     if radio.spectrum_enabled:
-        # Calculate available width for spectrum (account for panel padding and borders)
-        spectrum_width = max(40, width - 10)
-        spectrum_rows = radio.spectrum_analyzer.render(spectrum_width, height=6)
+        spectrum_rows = radio.spectrum_analyzer.render(height=6)
         spectrum_table = Table(show_header=False, box=None, padding=0, expand=False)
         spectrum_table.add_column("Spectrum")
         for row in spectrum_rows:
