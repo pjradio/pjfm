@@ -121,6 +121,16 @@ if error_syndrome in correction_table:
 - Bass boost: +3 dB low shelf at 250 Hz
 - Treble boost: +3 dB high shelf at 3.5 kHz
 
+**Stereo Blend**: Automatically reduces stereo separation on weak signals to minimize noise. The L-R (difference) channel carries most of the stereo noise, so blending toward mono (L+R only) significantly improves audio quality on fringe signals:
+
+| SNR | Blend |
+|-----|-------|
+| < 15 dB | 100% mono |
+| 15-30 dB | Gradual blend |
+| > 30 dB | 100% stereo |
+
+The blend factor is smoothed to prevent abrupt audio changes during signal fades.
+
 **Soft Limiting**: Prevents harsh clipping on over-modulated stations using tanh saturation:
 ```python
 output = tanh(input * 1.5) / tanh(1.5)
