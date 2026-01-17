@@ -282,9 +282,12 @@ class RDSDecoder:
 
         # Decoded RDS data
         self._pi_code = 0
+        self._pi_hex = ''  # Cached hex string
         self._ps_chars = [' '] * 8
+        self._ps_name = None  # Cached station name string
         self._ps_segment_seen = [False] * 4
         self._pty = 0
+        self._pty_name = PTY_NAMES.get(0, "None")  # Cached PTY name string
         self._rt_chars = [' '] * 64
         self._rt_flag = 0
         self._ct_time = None  # (hour, minute, utc_offset_half_hours) or None
@@ -759,12 +762,16 @@ class RDSDecoder:
         block_c = self.group_blocks[2]
         block_d = self.group_blocks[3]
 
-        self._pi_code = block_a
+        if block_a != self._pi_code:
+            self._pi_code = block_a
+            self._pi_hex = f'{block_a:04X}'
 
         group_type = (block_b >> 12) & 0x0F
         version = (block_b >> 11) & 0x01
         pty = (block_b >> 5) & 0x1F
-        self._pty = pty
+        if pty != self._pty:
+            self._pty = pty
+            self._pty_name = PTY_NAMES.get(pty, f"Unknown ({pty})")
 
         # Track group type distribution
         gt_key = f"{group_type}{'A' if version == 0 else 'B'}"
@@ -784,12 +791,26 @@ class RDSDecoder:
         char2 = block_d & 0xFF
 
         pos = segment * 2
+        changed = False
         if 0x20 <= char1 <= 0x7E:
-            self._ps_chars[pos] = chr(char1)
+            new_char = chr(char1)
+            if self._ps_chars[pos] != new_char:
+                self._ps_chars[pos] = new_char
+                changed = True
         if 0x20 <= char2 <= 0x7E:
-            self._ps_chars[pos + 1] = chr(char2)
+            new_char = chr(char2)
+            if self._ps_chars[pos + 1] != new_char:
+                self._ps_chars[pos + 1] = new_char
+                changed = True
 
+        was_complete = all(self._ps_segment_seen)
         self._ps_segment_seen[segment] = True
+        now_complete = all(self._ps_segment_seen)
+
+        # Rebuild cached name if chars changed, or if we just completed all segments
+        if (changed or (now_complete and not was_complete)) and now_complete:
+            name = ''.join(self._ps_chars).strip()
+            self._ps_name = name if name else None
 
     def _decode_group_2(self, block_b, block_c, block_d, version):
         """Decode Group 2A/2B: RadioText."""
@@ -866,9 +887,9 @@ class RDSDecoder:
 
         return {
             'pi_code': self._pi_code,
-            'pi_hex': f'{self._pi_code:04X}' if self._pi_code else '',
+            'pi_hex': self._pi_hex,
             'station_name': self.station_name,
-            'program_type': self.program_type,
+            'program_type': self._pty_name,
             'pty_code': self._pty,
             'radio_text': self.radio_text,
             'clock_time': self.clock_time,
@@ -896,17 +917,16 @@ class RDSDecoder:
 
     @property
     def station_name(self):
-        """Get decoded station name (PS) only when complete."""
-        # Only return PS name when all 4 segments have been received
+        """Get decoded station name (PS) only when complete (cached to prevent UI flicker)."""
+        # Return cached name - it's updated in _decode_group_0 when chars change
         if all(self._ps_segment_seen):
-            name = ''.join(self._ps_chars).strip()
-            return name if name else None
+            return self._ps_name
         return None
 
     @property
     def program_type(self):
-        """Get program type as string."""
-        return PTY_NAMES.get(self._pty, f"Unknown ({self._pty})")
+        """Get program type as string (cached to prevent UI flicker)."""
+        return self._pty_name
 
     @property
     def radio_text(self):
@@ -962,9 +982,12 @@ class RDSDecoder:
 
         # Decoded data
         self._pi_code = 0
+        self._pi_hex = ''
         self._ps_chars = [' '] * 8
+        self._ps_name = None
         self._ps_segment_seen = [False] * 4
         self._pty = 0
+        self._pty_name = PTY_NAMES.get(0, "None")
         self._rt_chars = [' '] * 64
         self._rt_flag = 0
         self._ct_time = None

@@ -656,8 +656,9 @@ class FMRadio:
 
                 # Auto mode: RDS is enabled when pilot is present
                 # (pilot = station has stereo/RDS capability)
+                # Don't enable RDS on noise - require signal above squelch threshold
                 if self.auto_mode_enabled and self.stereo_decoder:
-                    pilot_present = self.stereo_decoder.pilot_detected
+                    pilot_present = self.stereo_decoder.pilot_detected and dbm >= self.squelch_threshold
                     if pilot_present and not self.rds_enabled:
                         self.rds_enabled = True
                         # Reset decoder to clear any stale filter/timing state
@@ -848,6 +849,9 @@ class FMRadio:
     @property
     def pilot_detected(self):
         """Returns True if 19 kHz stereo pilot tone is detected."""
+        # Don't report pilot on noise - require signal above squelch threshold
+        if self.signal_dbm < self.squelch_threshold:
+            return False
         if self.stereo_decoder:
             return self.stereo_decoder.pilot_detected
         return False
@@ -864,6 +868,13 @@ class FMRadio:
         """Return peak audio amplitude (before limiting). >1.0 means limiter active."""
         if self.stereo_decoder:
             return self.stereo_decoder.peak_amplitude
+        return 0.0
+
+    @property
+    def stereo_blend_factor(self):
+        """Return stereo blend factor (0=mono, 1=full stereo)."""
+        if self.stereo_decoder:
+            return self.stereo_decoder.stereo_blend_factor
         return 0.0
 
     @property
@@ -1024,8 +1035,17 @@ def build_display(radio, width=80):
     table.add_row("", "")  # Spacer
     stereo_text = Text()
     if radio.pilot_detected:
-        stereo_text.append("Stereo", style="green bold")
-        stereo_text.append(" (19 kHz pilot detected)", style="green")
+        blend = radio.stereo_blend_factor
+        if blend >= 0.99:
+            stereo_text.append("Stereo", style="green bold")
+            stereo_text.append(" (19 kHz pilot detected)", style="green")
+        elif blend <= 0.01:
+            stereo_text.append("Mono", style="yellow")
+            stereo_text.append(" (blended - low SNR)", style="yellow")
+        else:
+            blend_pct = int(blend * 100)
+            stereo_text.append(f"Blend {blend_pct}%", style="yellow bold")
+            stereo_text.append(" (reduced stereo for noise)", style="yellow")
     else:
         stereo_text.append("Mono", style="yellow")
         stereo_text.append(" (no pilot)", style="dim")
@@ -1049,7 +1069,7 @@ def build_display(radio, width=80):
     if pty and pty != "None":
         if callsign or pi_hex:
             station_info.append("  ", style="")
-        station_info.append(f"[{pty}]", style="yellow")
+        station_info.append(f"({pty})", style="yellow")
     table.add_row("Station:", station_info)
 
     # Name line: PS (station branding)

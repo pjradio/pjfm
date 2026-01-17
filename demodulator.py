@@ -243,6 +243,12 @@ class FMStereoDecoder:
         self.treble_boost_enabled = True  # Default on
         self._setup_tone_filters()
 
+        # Stereo blend settings (blend to mono when SNR is low)
+        self.stereo_blend_enabled = True
+        self.stereo_blend_low = 15.0    # Below this SNR: full mono
+        self.stereo_blend_high = 30.0   # Above this SNR: full stereo
+        self._blend_factor = 1.0        # Current blend (0=mono, 1=stereo)
+
     def _design_low_shelf(self, fc, gain_db, fs):
         """Design low shelf biquad filter coefficients (Audio EQ Cookbook)."""
         A = 10 ** (gain_db / 40)  # sqrt of linear gain
@@ -315,6 +321,11 @@ class FMStereoDecoder:
     def peak_amplitude(self):
         """Return peak amplitude (before limiting). >1.0 means limiter is active."""
         return self._peak_amplitude
+
+    @property
+    def stereo_blend_factor(self):
+        """Return current stereo blend factor (0=mono, 1=full stereo)."""
+        return self._blend_factor
 
     @property
     def last_baseband(self):
@@ -407,16 +418,32 @@ class FMStereoDecoder:
             )
 
             # Matrix decode
-            left = lr_sum + lr_diff
-            right = lr_sum - lr_diff
+            left_stereo = lr_sum + lr_diff
+            right_stereo = lr_sum - lr_diff
 
             # SNR measurement for stereo (use full stereo bandwidth)
             signal_power = np.mean(lr_sum ** 2) + np.mean(lr_diff ** 2)
             audio_bandwidth = self.stereo_bandwidth
+
+            # Apply stereo blend based on SNR (blend to mono when noisy)
+            if self.stereo_blend_enabled:
+                # Calculate blend factor from SNR (smoothed for stability)
+                target_blend = (self._snr_db - self.stereo_blend_low) / (self.stereo_blend_high - self.stereo_blend_low)
+                target_blend = max(0.0, min(1.0, target_blend))
+                # Smooth blend factor to avoid sudden changes
+                self._blend_factor = 0.95 * self._blend_factor + 0.05 * target_blend
+
+                # Blend: 0 = mono (lr_sum), 1 = full stereo
+                left = self._blend_factor * left_stereo + (1.0 - self._blend_factor) * lr_sum
+                right = self._blend_factor * right_stereo + (1.0 - self._blend_factor) * lr_sum
+            else:
+                left = left_stereo
+                right = right_stereo
         else:
             # No stereo - output mono to both channels
             left = lr_sum
             right = lr_sum
+            self._blend_factor = 0.0  # Track that we're in mono
 
             # SNR measurement for mono (L+R only)
             signal_power = np.mean(lr_sum ** 2)
@@ -543,6 +570,7 @@ class FMStereoDecoder:
         self._signal_power = 0.0
         self._noise_power = 1e-10
         self._peak_amplitude = 0.0
+        self._blend_factor = 1.0  # Start at full stereo
 
         # Reset tone control filter states
         self.bass_state_l = signal.lfilter_zi(self.bass_b, self.bass_a)
