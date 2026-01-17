@@ -488,6 +488,7 @@ class FMRadio:
             fft_size=2048
         )
         self.spectrum_enabled = False
+        self.spectrum_box_enabled = True  # Show box around spectrum (not exposed in UI yet)
 
         # Squelch
         self.squelch_enabled = True
@@ -1257,7 +1258,17 @@ def build_display(radio, width=80):
         for row in spectrum_rows:
             spectrum_table.add_row(row)
         content.add_row(Text(""))  # Spacer
-        content.add_row(Align.center(spectrum_table))
+        if radio.spectrum_box_enabled:
+            spectrum_panel = Panel(
+                spectrum_table,
+                subtitle="[dim]Spectrum[/]",
+                box=box.ROUNDED,
+                border_style="dim",
+                padding=(0, 1),
+            )
+            content.add_row(Align.center(spectrum_panel))
+        else:
+            content.add_row(Align.center(spectrum_table))
 
     content.add_row(Align.center(controls))
     content.add_row(Align.center(presets))
