@@ -6,6 +6,8 @@ Provides FM stereo demodulation from IQ samples using quadrature demodulation
 with 19 kHz pilot detection and L-R subcarrier decoding.
 """
 
+import math
+import time
 import numpy as np
 from scipy import signal
 
@@ -18,8 +20,21 @@ class PilotPLL:
     19 kHz and 38 kHz carriers for stereo decoding.
 
     Uses a 2nd-order Type 2 PLL with proportional + integral
-    loop filter for smooth tracking and phase coherency.
+    loop filter. The feedback loop runs at a decimated rate
+    (~4 kHz) since the pilot BPF output has only ~1 kHz
+    bandwidth. The tracked phase is interpolated back to full
+    rate and carriers are generated with vectorized numpy trig.
+
+    This reduces the Python for-loop from ~8192 iterations to
+    ~105 per block while preserving lock performance (the loop
+    bandwidth is 100 Hz, well below the ~2 kHz Nyquist of the
+    decimated rate).
     """
+
+    # Target rate for the decimated PLL feedback loop (Hz).
+    # Must be > 2x loop bandwidth (100 Hz) for stability.
+    # 4 kHz gives 40x oversampling of the loop bandwidth.
+    PLL_RATE = 4000
 
     def __init__(self, sample_rate, center_freq=19000,
                  bandwidth=100, damping=0.707):
@@ -48,13 +63,22 @@ class PilotPLL:
         self.integrator = 0.0
         self.locked = False
 
-        # Precompute constants
+        # Full-rate constants
         self._dt = 1.0 / sample_rate
         self._omega_0 = 2 * np.pi * center_freq
+
+        # Decimation factor: run feedback loop at ~PLL_RATE
+        self._decim = max(1, int(sample_rate / self.PLL_RATE))
+        # Decimated time step (for the feedback loop)
+        self._dt_decim = self._decim / sample_rate
 
     def process(self, pilot_signal):
         """
         Process pilot signal through PLL.
+
+        The feedback loop runs on a decimated version of the pilot
+        signal. The resulting phase trajectory is interpolated to
+        full rate, then vectorized numpy trig generates the carriers.
 
         Args:
             pilot_signal: Filtered 19 kHz pilot samples (numpy array)
@@ -66,43 +90,66 @@ class PilotPLL:
                 - locked: True if PLL is locked to pilot
         """
         n = len(pilot_signal)
-        carrier_19k = np.zeros(n, dtype=np.float64)
-        carrier_38k = np.zeros(n, dtype=np.float64)
+        decim = self._decim
 
-        # Local copies for speed
+        # --- Decimated feedback loop ---
+        # Average the pilot signal over each decimation block to get
+        # a representative sample for phase detection.
+        n_decim = n // decim
+        remainder = n - n_decim * decim
+
+        # Reshape and average for decimation (fast, vectorized)
+        if n_decim > 0:
+            pilot_decim = pilot_signal[:n_decim * decim].reshape(n_decim, decim).mean(axis=1)
+        else:
+            pilot_decim = np.array([], dtype=pilot_signal.dtype)
+
+        # Handle remainder samples
+        if remainder > 0:
+            pilot_decim = np.append(pilot_decim, pilot_signal[n_decim * decim:].mean())
+            n_decim_total = n_decim + 1
+        else:
+            n_decim_total = n_decim
+
+        # Run scalar PLL at decimated rate — collect phase at each step
+        # We need phase values at decimated points, then interpolate
+        phase_points = np.empty(n_decim_total + 1, dtype=np.float64)
+        phase_points[0] = self.phase
+
         phase = self.phase
         integrator = self.integrator
         freq_offset = self.freq_offset
-        dt = self._dt
+        dt_decim = self._dt_decim
         omega_0 = self._omega_0
         Kp = self.Kp
         Ki = self.Ki
 
-        for i in range(n):
-            # NCO outputs
-            cos_phase = np.cos(phase)
-            sin_phase = np.sin(phase)
-            carrier_19k[i] = cos_phase
-            carrier_38k[i] = np.cos(2 * phase)
+        _sin = math.sin
+        _pi = math.pi
+        _two_pi = 2.0 * _pi
 
-            # Phase detector: multiply input by quadrature
-            # For cos input, sin output gives phase error
-            phase_error = pilot_signal[i] * sin_phase
+        for i in range(n_decim_total):
+            # Phase detector using current NCO phase vs decimated pilot
+            phase_error = pilot_decim[i] * _sin(phase)
 
             # Loop filter (PI controller)
-            integrator += phase_error * Ki * dt
+            integrator += phase_error * Ki * dt_decim
             freq_offset = Kp * phase_error + integrator
 
-            # Update NCO phase
-            phase += (omega_0 + freq_offset) * dt
+            # Advance phase by one decimated step
+            phase += (omega_0 + freq_offset) * dt_decim
 
-            # Wrap phase to [-pi, pi] to prevent overflow
-            while phase > np.pi:
-                phase -= 2 * np.pi
-            while phase < -np.pi:
-                phase += 2 * np.pi
+            # Wrap phase (single wrap is sufficient — phase step is
+            # decim * omega_0 * dt ≈ decim * 0.38 rad, well under pi
+            # even for decim=78)
+            if phase > _pi:
+                phase -= _two_pi
+            elif phase < -_pi:
+                phase += _two_pi
 
-        # Store state for next block
+            phase_points[i + 1] = phase
+
+        # Store state
         self.phase = phase
         self.integrator = integrator
         self.freq_offset = freq_offset
@@ -110,6 +157,29 @@ class PilotPLL:
         # Lock detection: frequency offset should be small when locked
         # Within 50 Hz of center = locked
         self.locked = abs(freq_offset) < 2 * np.pi * 50
+
+        # --- Interpolate phase to full rate (vectorized) ---
+        # phase_points[0] is the phase at sample 0 (start of block)
+        # phase_points[k] is the phase at sample k*decim
+        # We need phase at every sample 0..n-1
+
+        # Sample indices for the decimated phase points
+        decim_indices = np.arange(n_decim_total + 1) * decim
+        # Clamp last index to n for the remainder case
+        if remainder > 0:
+            decim_indices[-1] = n
+
+        # Full-rate sample indices
+        full_indices = np.arange(n)
+
+        # Linear interpolation of unwrapped phase
+        # Unwrap before interpolation to avoid discontinuities at ±pi
+        phase_unwrapped = np.unwrap(phase_points)
+        phase_full = np.interp(full_indices, decim_indices, phase_unwrapped)
+
+        # --- Vectorized carrier generation ---
+        carrier_19k = np.cos(phase_full)
+        carrier_38k = np.cos(2.0 * phase_full)
 
         return carrier_19k, carrier_38k, self.locked
 
@@ -169,27 +239,27 @@ class FMStereoDecoder:
         # Design filters (all at IQ sample rate)
         nyq = iq_sample_rate / 2
 
-        # Pilot bandpass filter (18.5-19.5 kHz) - reduced taps for speed
+        # Pilot bandpass filter (18.5-19.5 kHz) — Kaiser beta=7.0 (~70 dB stopband)
         pilot_low = 18500 / nyq
         pilot_high = 19500 / nyq
-        self.pilot_bpf = signal.firwin(101, [pilot_low, pilot_high],
-                                        pass_zero=False, window='hamming')
+        self.pilot_bpf = signal.firwin(201, [pilot_low, pilot_high],
+                                        pass_zero=False, window=('kaiser', 7.0))
         self.pilot_bpf_state = signal.lfilter_zi(self.pilot_bpf, 1.0)
 
-        # L+R lowpass filter (15 kHz)
+        # L+R lowpass filter (15 kHz) — Kaiser beta=6.0 (~60 dB stopband)
         lr_sum_cutoff = 15000 / nyq
-        self.lr_sum_lpf = signal.firwin(51, lr_sum_cutoff, window='hamming')
+        self.lr_sum_lpf = signal.firwin(127, lr_sum_cutoff, window=('kaiser', 6.0))
         self.lr_sum_lpf_state = signal.lfilter_zi(self.lr_sum_lpf, 1.0)
 
-        # L-R bandpass filter (23-53 kHz) - reduced taps for speed
+        # L-R bandpass filter (23-53 kHz) — Kaiser beta=7.0 (~70 dB stopband)
         lr_diff_low = 23000 / nyq
         lr_diff_high = min(53000 / nyq, 0.95)  # Stay below Nyquist
-        self.lr_diff_bpf = signal.firwin(101, [lr_diff_low, lr_diff_high],
-                                          pass_zero=False, window='hamming')
+        self.lr_diff_bpf = signal.firwin(201, [lr_diff_low, lr_diff_high],
+                                          pass_zero=False, window=('kaiser', 7.0))
         self.lr_diff_bpf_state = signal.lfilter_zi(self.lr_diff_bpf, 1.0)
 
-        # L-R lowpass filter after demodulation (15 kHz)
-        self.lr_diff_lpf = signal.firwin(51, lr_sum_cutoff, window='hamming')
+        # L-R lowpass filter after demodulation (15 kHz) — Kaiser beta=6.0 (~60 dB stopband)
+        self.lr_diff_lpf = signal.firwin(127, lr_sum_cutoff, window=('kaiser', 6.0))
         self.lr_diff_lpf_state = signal.lfilter_zi(self.lr_diff_lpf, 1.0)
 
         # De-emphasis filter (at output audio rate)
@@ -206,7 +276,7 @@ class FMStereoDecoder:
         noise_high = min(95000 / nyq, 0.95)
         if noise_high > noise_low:
             self.noise_bpf = signal.firwin(51, [noise_low, noise_high],
-                                           pass_zero=False, window='hamming')
+                                           pass_zero=False, window=('kaiser', 5.0))
             self.noise_bpf_state = signal.lfilter_zi(self.noise_bpf, 1.0)
             self.noise_bandwidth = 20000  # Hz
         else:
@@ -222,6 +292,15 @@ class FMStereoDecoder:
 
         # Peak amplitude tracking (for clipping detection)
         self._peak_amplitude = 0.0
+
+        # Group delay compensation buffer for L+R path.
+        # The L-R path passes through an extra BPF (201 taps, delay=100)
+        # before reaching the LPF. Both LPFs are 127-tap so their delays
+        # cancel. Without compensation the L+R and L-R signals are
+        # misaligned by 100 samples (~400 us at 250 kHz), which destroys
+        # stereo separation at higher audio frequencies.
+        self._lr_sum_delay = (len(self.lr_diff_bpf) - 1) // 2
+        self._lr_sum_delay_buf = np.zeros(self._lr_sum_delay, dtype=np.float64)
 
         # Store last baseband for RDS processing
         self._last_baseband = None
@@ -242,11 +321,33 @@ class FMStereoDecoder:
         self.treble_boost_enabled = True  # Default on
         self._setup_tone_filters()
 
+        # Optional GPU demodulator for baseband step
+        self.gpu_demodulator = None
+        # Optional GPU resampler for rate conversion step
+        self.gpu_resampler = None
+
         # Stereo blend settings (blend to mono when SNR is low)
         self.stereo_blend_enabled = True
         self.stereo_blend_low = 15.0    # Below this SNR: full mono
         self.stereo_blend_high = 30.0   # Above this SNR: full stereo
         self._blend_factor = 1.0        # Current blend (0=mono, 1=stereo)
+
+        # Per-stage profiling (EMA-smoothed, microseconds)
+        self.profile_enabled = False
+        self._profile = {
+            'fm_demod': 0.0,
+            'pilot_bpf': 0.0,
+            'pll': 0.0,
+            'lr_sum_lpf': 0.0,
+            'lr_diff_bpf': 0.0,
+            'lr_diff_lpf': 0.0,
+            'noise_bpf': 0.0,
+            'resample': 0.0,
+            'deemphasis': 0.0,
+            'tone': 0.0,
+            'limiter': 0.0,
+            'total': 0.0,
+        }
 
     def _design_low_shelf(self, fc, gain_db, fs):
         """Design low shelf biquad filter coefficients (Audio EQ Cookbook)."""
@@ -327,6 +428,11 @@ class FMStereoDecoder:
         return self._blend_factor
 
     @property
+    def profile(self):
+        """Return per-stage profiling data (EMA-smoothed microseconds)."""
+        return dict(self._profile)
+
+    @property
     def last_baseband(self):
         """Returns the last FM baseband signal for RDS processing.
 
@@ -344,6 +450,12 @@ class FMStereoDecoder:
         """
         return self._last_pilot
 
+    def _prof(self, key, t0):
+        """Record EMA-smoothed stage timing in microseconds."""
+        elapsed = (time.perf_counter() - t0) * 1e6
+        self._profile[key] = 0.9 * self._profile[key] + 0.1 * elapsed
+        return time.perf_counter()
+
     def demodulate(self, iq_samples):
         """
         Demodulate FM stereo signal from IQ samples.
@@ -357,16 +469,29 @@ class FMStereoDecoder:
         if len(iq_samples) == 0:
             return np.zeros((0, 2), dtype=np.float32)
 
-        # FM demodulation (quadrature discriminator)
-        samples = np.concatenate([[self.last_sample], iq_samples])
-        self.last_sample = iq_samples[-1]
+        profiling = self.profile_enabled
+        if profiling:
+            t_total = time.perf_counter()
+            t0 = t_total
 
-        product = samples[1:] * np.conj(samples[:-1])
-        baseband = np.angle(product) * (self.iq_sample_rate / (2 * np.pi * self.deviation))
+        # FM demodulation
+        if self.gpu_demodulator is not None:
+            # GPU arctangent-differentiate method
+            baseband = self.gpu_demodulator.demodulate(iq_samples)
+            # Still update last_sample for continuity if GPU is toggled off
+            self.last_sample = iq_samples[-1]
+        else:
+            # CPU quadrature discriminator
+            samples = np.concatenate([[self.last_sample], iq_samples])
+            self.last_sample = iq_samples[-1]
+            product = samples[1:] * np.conj(samples[:-1])
+            baseband = np.angle(product) * (self.iq_sample_rate / (2 * np.pi * self.deviation))
 
         # Store baseband for RDS processing (at IQ sample rate, before decimation)
-        # No copy needed - baseband is a fresh array from np.angle() * scalar
         self._last_baseband = baseband
+
+        if profiling:
+            t0 = self._prof('fm_demod', t0)
 
         # Extract pilot tone (19 kHz)
         pilot, self.pilot_bpf_state = signal.lfilter(
@@ -380,6 +505,9 @@ class FMStereoDecoder:
         pilot_power = np.sqrt(np.mean(pilot ** 2))
         # Smooth the pilot level measurement
         self._pilot_level = 0.9 * self._pilot_level + 0.1 * pilot_power
+
+        if profiling:
+            t0 = self._prof('pilot_bpf', t0)
 
         # Pilot detection: require both RMS threshold AND PLL lock (if using PLL)
         # This prevents false positives from broadband noise on blank stations
@@ -397,16 +525,33 @@ class FMStereoDecoder:
         else:
             self._pilot_detected = False
 
+        if profiling:
+            t0 = self._prof('pll', t0)
+
         # Extract L+R (mono, 0-15 kHz)
         lr_sum, self.lr_sum_lpf_state = signal.lfilter(
             self.lr_sum_lpf, 1.0, baseband, zi=self.lr_sum_lpf_state
         )
+
+        # Apply group delay compensation: delay L+R to align with L-R path
+        delay = self._lr_sum_delay
+        delayed = np.empty_like(lr_sum)
+        delayed[:delay] = self._lr_sum_delay_buf
+        delayed[delay:] = lr_sum[:-delay] if delay > 0 else lr_sum
+        self._lr_sum_delay_buf = lr_sum[-delay:].copy()
+        lr_sum = delayed
+
+        if profiling:
+            t0 = self._prof('lr_sum_lpf', t0)
 
         if self._pilot_detected:
             # Extract L-R subcarrier region (23-53 kHz)
             lr_diff_mod, self.lr_diff_bpf_state = signal.lfilter(
                 self.lr_diff_bpf, 1.0, baseband, zi=self.lr_diff_bpf_state
             )
+
+            if profiling:
+                t0 = self._prof('lr_diff_bpf', t0)
 
             # Demodulate L-R by multiplying with 38 kHz carrier
             lr_diff_demod = lr_diff_mod * carrier_38k * 2  # *2 for DSB-SC gain
@@ -415,6 +560,9 @@ class FMStereoDecoder:
             lr_diff, self.lr_diff_lpf_state = signal.lfilter(
                 self.lr_diff_lpf, 1.0, lr_diff_demod, zi=self.lr_diff_lpf_state
             )
+
+            if profiling:
+                t0 = self._prof('lr_diff_lpf', t0)
 
             # Matrix decode
             left_stereo = lr_sum + lr_diff
@@ -465,9 +613,18 @@ class FMStereoDecoder:
             if self._noise_power > 0:
                 self._snr_db = 10 * np.log10(self._signal_power / self._noise_power)
 
+        if profiling:
+            t0 = self._prof('noise_bpf', t0)
+
         # Resample to audio rate
-        left = signal.resample_poly(left, self.resample_up, self.resample_down)
-        right = signal.resample_poly(right, self.resample_up, self.resample_down)
+        if self.gpu_resampler is not None:
+            left, right = self.gpu_resampler.resample(left, right)
+        else:
+            left = signal.resample_poly(left, self.resample_up, self.resample_down)
+            right = signal.resample_poly(right, self.resample_up, self.resample_down)
+
+        if profiling:
+            t0 = self._prof('resample', t0)
 
         # Apply de-emphasis to each channel
         left, self.deem_state_l = signal.lfilter(
@@ -476,6 +633,9 @@ class FMStereoDecoder:
         right, self.deem_state_r = signal.lfilter(
             self.deem_b, self.deem_a, right, zi=self.deem_state_r
         )
+
+        if profiling:
+            t0 = self._prof('deemphasis', t0)
 
         # Apply tone controls (bass and treble boost)
         if self.bass_boost_enabled:
@@ -492,6 +652,9 @@ class FMStereoDecoder:
             right, self.treble_state_r = signal.lfilter(
                 self.treble_b, self.treble_a, right, zi=self.treble_state_r
             )
+
+        if profiling:
+            t0 = self._prof('tone', t0)
 
         # Track peak amplitude (before limiting, for clipping detection)
         peak = max(np.max(np.abs(left)), np.max(np.abs(right)))
@@ -510,6 +673,11 @@ class FMStereoDecoder:
         right = np.clip(right, -1.0, 1.0)
         left = left.astype(np.float32)
         right = right.astype(np.float32)
+
+        if profiling:
+            self._prof('limiter', t0)
+            elapsed_total = (time.perf_counter() - t_total) * 1e6
+            self._profile['total'] = 0.9 * self._profile['total'] + 0.1 * elapsed_total
 
         return np.column_stack((left, right))
 
@@ -560,6 +728,9 @@ class FMStereoDecoder:
         self.deem_state_r = signal.lfilter_zi(self.deem_b, self.deem_a)
         if self.noise_bpf is not None:
             self.noise_bpf_state = signal.lfilter_zi(self.noise_bpf, 1.0)
+
+        # Reset group delay compensation buffer
+        self._lr_sum_delay_buf = np.zeros(self._lr_sum_delay, dtype=np.float64)
 
         # Reset PLL state
         self.pilot_pll.reset()
@@ -809,60 +980,3 @@ class NBFMDecoder:
             self.noise_bpf_state = signal.lfilter_zi(self.noise_bpf, 1.0)
         self.bass_state_l = signal.lfilter_zi(self.bass_b, self.bass_a)
         self.treble_state_l = signal.lfilter_zi(self.treble_b, self.treble_a)
-
-
-if __name__ == "__main__":
-    # Test with synthetic FM signal
-    import matplotlib
-    matplotlib.use('Agg')  # Non-interactive backend
-    import matplotlib.pyplot as plt
-
-    # Parameters
-    iq_rate = 250000
-    audio_rate = 48000
-    duration = 0.1  # 100ms test
-    audio_freq = 1000  # 1 kHz test tone
-    deviation = 75000
-
-    # Generate test audio (1 kHz sine wave)
-    t_audio = np.arange(int(duration * iq_rate)) / iq_rate
-    audio_in = np.sin(2 * np.pi * audio_freq * t_audio)
-
-    # FM modulate
-    phase = 2 * np.pi * deviation * np.cumsum(audio_in) / iq_rate
-    iq_signal = np.exp(1j * phase).astype(np.complex64)
-
-    # Demodulate using stereo decoder (handles mono signals gracefully)
-    demod = FMStereoDecoder(iq_rate, audio_rate, deviation)
-    audio_out = demod.demodulate(iq_signal)
-
-    print(f"Input: {len(iq_signal)} IQ samples")
-    print(f"Output: {len(audio_out)} audio samples (stereo)")
-    print(f"Audio range L: [{audio_out[:, 0].min():.3f}, {audio_out[:, 0].max():.3f}]")
-    print(f"Audio range R: [{audio_out[:, 1].min():.3f}, {audio_out[:, 1].max():.3f}]")
-
-    # Plot
-    fig, axes = plt.subplots(2, 1, figsize=(10, 6))
-
-    # Input audio (first few ms)
-    samples_to_show = int(0.01 * iq_rate)
-    axes[0].plot(t_audio[:samples_to_show] * 1000, audio_in[:samples_to_show])
-    axes[0].set_xlabel('Time (ms)')
-    axes[0].set_ylabel('Amplitude')
-    axes[0].set_title('Input Audio (1 kHz tone)')
-    axes[0].grid(True)
-
-    # Output audio (left channel)
-    t_out = np.arange(len(audio_out)) / audio_rate
-    samples_out = int(0.01 * audio_rate)
-    axes[1].plot(t_out[:samples_out] * 1000, audio_out[:samples_out, 0], label='Left')
-    axes[1].plot(t_out[:samples_out] * 1000, audio_out[:samples_out, 1], label='Right', alpha=0.7)
-    axes[1].set_xlabel('Time (ms)')
-    axes[1].set_ylabel('Amplitude')
-    axes[1].set_title('Demodulated Audio (Stereo)')
-    axes[1].legend()
-    axes[1].grid(True)
-
-    plt.tight_layout()
-    plt.savefig('demod_test.png')
-    print("Test plot saved to demod_test.png")
