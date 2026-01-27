@@ -63,6 +63,9 @@ class PilotPLL:
         self.integrator = 0.0
         self.locked = False
 
+        # Phase error variance tracking for pilot-referenced SNR
+        self._phase_error_var = 0.0  # EMA-smoothed variance
+
         # Full-rate constants
         self._dt = 1.0 / sample_rate
         self._omega_0 = 2 * np.pi * center_freq
@@ -128,9 +131,15 @@ class PilotPLL:
         _pi = math.pi
         _two_pi = 2.0 * _pi
 
+        pe_sum = 0.0
+        pe_sq_sum = 0.0
+
         for i in range(n_decim_total):
             # Phase detector using current NCO phase vs decimated pilot
             phase_error = pilot_decim[i] * _sin(phase)
+
+            pe_sum += phase_error
+            pe_sq_sum += phase_error * phase_error
 
             # Loop filter (PI controller)
             integrator += phase_error * Ki * dt_decim
@@ -153,6 +162,12 @@ class PilotPLL:
         self.phase = phase
         self.integrator = integrator
         self.freq_offset = freq_offset
+
+        # Phase error variance (EMA-smoothed across blocks)
+        if n_decim_total > 1:
+            pe_mean = pe_sum / n_decim_total
+            pe_var = pe_sq_sum / n_decim_total - pe_mean * pe_mean
+            self._phase_error_var = 0.9 * self._phase_error_var + 0.1 * max(pe_var, 1e-20)
 
         # Lock detection: frequency offset should be small when locked
         # Within 50 Hz of center = locked
@@ -183,12 +198,18 @@ class PilotPLL:
 
         return carrier_19k, carrier_38k, self.locked
 
+    @property
+    def phase_error_variance(self):
+        """Return EMA-smoothed phase error variance for SNR estimation."""
+        return self._phase_error_var
+
     def reset(self):
         """Reset PLL state (call when changing frequency)."""
         self.phase = 0.0
         self.freq_offset = 0.0
         self.integrator = 0.0
         self.locked = False
+        self._phase_error_var = 0.0
 
 
 class FMStereoDecoder:
@@ -312,7 +333,7 @@ class FMStereoDecoder:
         self.pilot_pll = PilotPLL(
             sample_rate=iq_sample_rate,
             center_freq=19000,
-            bandwidth=100,    # 100 Hz loop bandwidth
+            bandwidth=50,     # 50 Hz loop bandwidth (cleaner carrier)
             damping=0.707     # Critical damping
         )
 
