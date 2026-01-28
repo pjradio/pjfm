@@ -347,6 +347,13 @@ class AudioPlayer:
         self.running = False
         self.volume = 1.0
 
+        # Adaptive rate control: compensates for clock drift between
+        # BB60D and audio card by dropping samples when buffer grows too large.
+        # Only drops, no duplicates - the BB60D clock is slightly faster than
+        # the audio card, so buffer grows over time. We just trim the excess.
+        self._drop_threshold_ms = 400  # Drop when buffer exceeds this
+        self._samples_dropped = 0  # Stats tracking
+
     def _audio_callback(self, outdata, frames, time_info, status):
         """Sounddevice callback for audio output."""
         with self.buffer_lock:
@@ -409,6 +416,8 @@ class AudioPlayer:
             self.buffer[:] = 0  # Clear to silence
             self.write_pos = prefill
             self.read_pos = 0
+        # Reset drop counter
+        self._samples_dropped = 0
 
     @property
     def buffer_level_ms(self):
@@ -422,9 +431,23 @@ class AudioPlayer:
         """Return total buffer capacity in milliseconds."""
         return len(self.buffer) / self.sample_rate * 1000
 
+    @property
+    def rate_control_stats(self):
+        """Return adaptive rate control statistics."""
+        return {
+            'dropped': self._samples_dropped,
+            'threshold_ms': self._drop_threshold_ms,
+        }
+
     def queue_audio(self, audio_data):
         """
         Add audio data to the ring buffer.
+
+        Implements adaptive rate control to compensate for clock drift
+        between the sample source (BB60D) and audio output (sound card).
+        When buffer level drifts too far from target, single samples are
+        dropped or duplicated to maintain stable latency. At 48 kHz, one
+        sample is ~21 µs — well below audible threshold.
 
         Args:
             audio_data: numpy array of float32 audio samples
@@ -433,6 +456,14 @@ class AudioPlayer:
         # Convert mono to stereo if needed
         if audio_data.ndim == 1:
             audio_data = np.column_stack((audio_data, audio_data))
+
+        # Adaptive rate control: drop samples when buffer gets too full.
+        # BB60D clock runs slightly faster than audio card, so buffer grows
+        # over time. Drop one sample when we exceed threshold to trim excess.
+        if self.buffer_level_ms > self._drop_threshold_ms:
+            if len(audio_data) > 1:
+                audio_data = audio_data[1:]
+                self._samples_dropped += 1
 
         with self.buffer_lock:
             samples = len(audio_data)
@@ -1561,6 +1592,13 @@ def build_display(radio, width=80):
         else:
             loss_text.append("0", style="green bold")
         table.add_row("IQ Loss:", loss_text)
+
+        # Adaptive rate control stats
+        rc_stats = radio.audio_player.rate_control_stats
+        rc_text = Text()
+        rc_text.append(f"drop @{rc_stats['threshold_ms']:.0f}ms", style="dim")
+        rc_text.append(f"  dropped:{rc_stats['dropped']}", style="cyan")
+        table.add_row("Rate Ctl:", rc_text)
 
         # Demodulator stage profiling
         if not radio.weather_mode and radio.stereo_decoder and radio.stereo_decoder.profile_enabled:

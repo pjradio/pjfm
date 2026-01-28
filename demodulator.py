@@ -674,6 +674,12 @@ class FMStereoDecoder:
         if profiling:
             t0 = self._prof('deemphasis', t0)
 
+        # Scale down to provide headroom for tone controls and over-modulated stations.
+        # Applied BEFORE tone controls so boosts don't cause clipping.
+        # 0.5 (-6dB) provides headroom for +3dB bass and +3dB treble.
+        left = left * 0.5
+        right = right * 0.5
+
         # Apply tone controls (bass and treble boost)
         if self.bass_boost_enabled:
             left, self.bass_state_l = signal.lfilter(
@@ -697,15 +703,13 @@ class FMStereoDecoder:
         peak = max(np.max(np.abs(left)), np.max(np.abs(right)))
         self._peak_amplitude = max(0.95 * self._peak_amplitude, peak)  # Fast attack, slow decay
 
-        # Apply soft limiting to prevent harsh clipping distortion
-        # Scale down slightly to provide headroom for over-modulated stations
-        left = left * 0.7
-        right = right * 0.7
-        # Soft limiter using tanh (smooth saturation instead of hard clipping)
+        # Apply soft limiting to catch any remaining peaks.
+        # After 0.5 scaling + up to +6dB tone boost, signal is typically ~0.7 max.
+        # Soft limiter using tanh handles any peaks that still exceed 1.0.
         tanh_scale = np.tanh(1.5)
         left = np.tanh(left * 1.5) / tanh_scale
         right = np.tanh(right * 1.5) / tanh_scale
-        # Hard clip to ensure output never exceeds ±1.0 (tanh asymptote is 1.105)
+        # Hard clip to ensure output never exceeds ±1.0
         left = np.clip(left, -1.0, 1.0)
         right = np.clip(right, -1.0, 1.0)
         left = left.astype(np.float32)
@@ -980,6 +984,9 @@ class NBFMDecoder:
         # Resample to audio rate
         audio = signal.resample_poly(audio, self.resample_up, self.resample_down)
 
+        # Scale down to provide headroom for tone controls
+        audio = audio * 0.5
+
         # Apply tone controls
         if self.bass_boost_enabled:
             audio, self.bass_state_l = signal.lfilter(
@@ -994,8 +1001,7 @@ class NBFMDecoder:
         peak = np.max(np.abs(audio))
         self._peak_amplitude = max(0.95 * self._peak_amplitude, peak)
 
-        # Apply soft limiting
-        audio = audio * 0.7
+        # Apply soft limiting to catch any remaining peaks
         tanh_scale = np.tanh(1.5)
         audio = np.tanh(audio * 1.5) / tanh_scale
         audio = np.clip(audio, -1.0, 1.0).astype(np.float32)
