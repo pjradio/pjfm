@@ -58,11 +58,16 @@ except ImportError:
     sys.exit(1)
 
 try:
-    from bb60d import BB60D, get_api_version
+    from bb60d import BB60D, get_api_version as bb60d_get_api_version
 except ImportError as e:
-    print(f"Error importing bb60d: {e}")
-    print("Make sure bb60d.py is in the same directory and the BB API library is installed.")
-    sys.exit(1)
+    BB60D = None
+    bb60d_get_api_version = None
+
+try:
+    from icom_r8600 import IcomR8600, get_api_version as r8600_get_api_version
+except ImportError as e:
+    IcomR8600 = None
+    r8600_get_api_version = None
 
 from demodulator import FMStereoDecoder, NBFMDecoder
 from gpu import GPUFMDemodulator, GPUResampler, GPUFIRBank, GPUFIRFilter
@@ -495,10 +500,11 @@ class FMRadio:
     FM Radio application controller.
 
     Uses IQ streaming with software FM demodulation.
+    Supports BB60D and IC-R8600 as I/Q sources.
     """
 
     # IQ streaming parameters
-    IQ_SAMPLE_RATE = 250000  # Results in 312.5kHz (40MHz/128)
+    IQ_SAMPLE_RATE = 250000  # Results in 312.5kHz (40MHz/128) for BB60D, ~480kHz for R8600
     AUDIO_SAMPLE_RATE = 48000
     IQ_BLOCK_SIZE = 8192  # ~26.2ms budget at 312.5kHz
 
@@ -511,14 +517,25 @@ class FMRadio:
     # Config file path (in same directory as script)
     CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'pyfm.cfg')
 
-    def __init__(self, initial_freq=89.9e6):
+    def __init__(self, initial_freq=89.9e6, use_icom=False):
         """
         Initialize FM Radio.
 
         Args:
             initial_freq: Initial frequency in Hz
+            use_icom: If True, use IC-R8600 instead of BB60D
         """
-        self.device = BB60D()
+        self.use_icom = use_icom
+
+        if use_icom:
+            if IcomR8600 is None:
+                raise RuntimeError("IC-R8600 support not available. Check icom_r8600.py and pyusb installation.")
+            self.device = IcomR8600()
+        else:
+            if BB60D is None:
+                raise RuntimeError("BB60D support not available. Check bb60d.py and BB API installation.")
+            self.device = BB60D()
+
         self.device.frequency = initial_freq
 
         # Audio player at 48 kHz with stereo support
@@ -1751,7 +1768,8 @@ def build_display(radio, width=80):
         panel_title = "[bold yellow]🌦️ pyfm[/] [dim]- NOAA Weather Radio[/]"
         border_style = "yellow"
     else:
-        panel_title = "[bold cyan]📻 pyfm[/] [dim]- SignalHound BB60D FM Receiver[/]"
+        device_name = "Icom IC-R8600" if radio.use_icom else "SignalHound BB60D"
+        panel_title = f"[bold cyan]📻 pyfm[/] [dim]- {device_name} FM Receiver[/]"
         border_style = "cyan"
 
     panel = Panel(
@@ -1922,7 +1940,7 @@ def run_rich_ui(radio):
 def main():
     """Main entry point."""
     parser = argparse.ArgumentParser(
-        description="pyfm - FM Radio Receiver for SignalHound BB60D"
+        description="pyfm - FM Radio Receiver for SignalHound BB60D or Icom IC-R8600"
     )
     parser.add_argument(
         "frequency",
@@ -1930,6 +1948,11 @@ def main():
         type=float,
         default=None,
         help="Initial frequency in MHz (default: last used or 89.9)"
+    )
+    parser.add_argument(
+        "--icom",
+        action="store_true",
+        help="Use Icom IC-R8600 as I/Q source instead of BB60D"
     )
     parser.add_argument(
         "--version",
@@ -1940,11 +1963,21 @@ def main():
     args = parser.parse_args()
 
     if args.version:
-        try:
-            print("pyfm - FM Radio Receiver")
-            print(f"BB API Version: {get_api_version()}")
-        except Exception as e:
-            print(f"Could not get API version: {e}")
+        print("pyfm - FM Radio Receiver")
+        if bb60d_get_api_version:
+            try:
+                print(f"BB60D API Version: {bb60d_get_api_version()}")
+            except Exception as e:
+                print(f"BB60D: not available ({e})")
+        else:
+            print("BB60D: not available")
+        if r8600_get_api_version:
+            try:
+                print(f"IC-R8600: {r8600_get_api_version()}")
+            except Exception as e:
+                print(f"IC-R8600: not available ({e})")
+        else:
+            print("IC-R8600: not available")
         return
 
     # Determine initial frequency
@@ -1970,7 +2003,7 @@ def main():
                 pass
 
     # Create radio instance
-    radio = FMRadio(initial_freq=initial_freq)
+    radio = FMRadio(initial_freq=initial_freq, use_icom=args.icom)
 
     # Run rich UI
     try:
@@ -1981,7 +2014,8 @@ def main():
         print(f"Error: {e}")
         sys.exit(1)
 
-    print(f"\n📻 Goodbye! Last frequency: {radio.frequency_mhz:.1f} MHz")
+    device_name = "IC-R8600" if args.icom else "BB60D"
+    print(f"\n📻 Goodbye! Last frequency: {radio.frequency_mhz:.1f} MHz ({device_name})")
 
     # Hard exit to prevent ROCm/HIP double-free during Python shutdown.
     # Python's atexit handlers and GC race with the HIP runtime teardown,
