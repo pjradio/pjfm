@@ -257,6 +257,11 @@ class FMStereoDecoder:
         self.resample_up = audio_int // g
         self.resample_down = iq_int // g
 
+        # Adaptive rate control: adjusts resample ratio to match audio card clock
+        # 1.0 = nominal, >1.0 = produce more samples (buffer low), <1.0 = fewer (buffer high)
+        self._rate_adjust = 1.0
+        self._nominal_ratio = audio_sample_rate / iq_sample_rate
+
         # Design filters (all at IQ sample rate)
         nyq = iq_sample_rate / 2
 
@@ -292,24 +297,29 @@ class FMStereoDecoder:
         self.deem_state_l = signal.lfilter_zi(self.deem_b, self.deem_a)
         self.deem_state_r = signal.lfilter_zi(self.deem_b, self.deem_a)
 
-        # Design noise measurement bandpass filter (75-95 kHz)
-        noise_low = 75000 / nyq
-        noise_high = min(95000 / nyq, 0.95)
-        if noise_high > noise_low:
+        # Design noise measurement bandpass filter (80-120 kHz)
+        # Must be:
+        # - Above FM multiplex (stereo 38 kHz, RDS 57 kHz, HD sidebands ~75 kHz)
+        # - Below 0.8 of Nyquist for good filter performance at all sample rates
+        # At 480 kHz (R8600): 80-120 kHz is 0.33-0.50 of Nyquist (240 kHz) - good
+        # At 312.5 kHz (BB60D): 80-120 kHz is 0.51-0.77 of Nyquist (156.25 kHz) - good
+        noise_low_hz = 80000
+        noise_high_hz = 120000
+        noise_low = noise_low_hz / nyq
+        noise_high = min(noise_high_hz / nyq, 0.90)
+        if noise_high > noise_low and noise_low < 0.90:
             self.noise_bpf = signal.firwin(51, [noise_low, noise_high],
                                            pass_zero=False, window=('kaiser', 5.0))
             self.noise_bpf_state = signal.lfilter_zi(self.noise_bpf, 1.0)
-            self.noise_bandwidth = 20000  # Hz
+            self.noise_bandwidth = noise_high_hz - noise_low_hz  # 40000 Hz
         else:
             self.noise_bpf = None
 
-        # SNR measurement state
+        # SNR measurement state (pilot-referenced)
+        # We use the 19 kHz pilot as the reference since it's broadcast at a fixed level
         self._snr_db = 0.0
-        self._signal_power = 0.0
         self._noise_power = 1e-10
-        # Audio bandwidth: 15 kHz for mono-compatible (L+R), or 53 kHz for full stereo
-        self.mono_bandwidth = 15000    # L+R only
-        self.stereo_bandwidth = 53000  # Full stereo (L+R + L-R)
+        self.pilot_bandwidth = 1000  # Hz (18.5-19.5 kHz BPF)
 
         # Peak amplitude tracking (for clipping detection)
         self._peak_amplitude = 0.0
@@ -327,9 +337,10 @@ class FMStereoDecoder:
         self._last_baseband = None
         self._last_pilot = None
 
-        # PLL for pilot tracking (optional, default enabled)
-        # Provides cleaner 38 kHz carrier with better phase coherency
-        self.use_pll = True
+        # PLL for pilot tracking (optional, default disabled due to aliasing bug)
+        # PLL decimates to ~4 kHz which aliases the 19 kHz pilot incorrectly
+        # Pilot-squaring fallback provides correct stereo decode
+        self.use_pll = False
         self.pilot_pll = PilotPLL(
             sample_rate=iq_sample_rate,
             center_freq=19000,
@@ -352,9 +363,12 @@ class FMStereoDecoder:
         self.gpu_fir_lr_diff = None
 
         # Stereo blend settings (blend to mono when SNR is low)
+        # Thresholds based on pilot SNR measurement:
+        # - 8 dB: very weak signal, use mono to reduce noise
+        # - 20 dB: good signal, full stereo separation
         self.stereo_blend_enabled = True
-        self.stereo_blend_low = 15.0    # Below this SNR: full mono
-        self.stereo_blend_high = 30.0   # Above this SNR: full stereo
+        self.stereo_blend_low = 8.0     # Below this SNR: full mono
+        self.stereo_blend_high = 20.0   # Above this SNR: full stereo
         self._blend_factor = 1.0        # Current blend (0=mono, 1=stereo)
 
         # Per-stage profiling (EMA-smoothed, microseconds)
@@ -451,6 +465,17 @@ class FMStereoDecoder:
     def stereo_blend_factor(self):
         """Return current stereo blend factor (0=mono, 1=full stereo)."""
         return self._blend_factor
+
+    @property
+    def rate_adjust(self):
+        """Return current rate adjustment factor for adaptive resampling."""
+        return self._rate_adjust
+
+    @rate_adjust.setter
+    def rate_adjust(self, value):
+        """Set rate adjustment factor (0.99-1.01 typical range for clock drift)."""
+        # Clamp to reasonable range to prevent audio artifacts
+        self._rate_adjust = max(0.98, min(1.02, value))
 
     @property
     def profile(self):
@@ -605,10 +630,6 @@ class FMStereoDecoder:
             left_stereo = lr_sum + lr_diff
             right_stereo = lr_sum - lr_diff
 
-            # SNR measurement for stereo (use full stereo bandwidth)
-            signal_power = np.mean(lr_sum ** 2) + np.mean(lr_diff ** 2)
-            audio_bandwidth = self.stereo_bandwidth
-
             # Apply stereo blend based on SNR (blend to mono when noisy)
             if self.stereo_blend_enabled:
                 # Calculate blend factor from SNR (smoothed for stability)
@@ -629,36 +650,42 @@ class FMStereoDecoder:
             right = lr_sum
             self._blend_factor = 0.0  # Track that we're in mono
 
-            # SNR measurement for mono (L+R only)
-            signal_power = np.mean(lr_sum ** 2)
-            audio_bandwidth = self.mono_bandwidth
-
-        # Measure noise power (in high frequency band above all subcarriers)
+        # Pilot-referenced SNR measurement
+        # The 19 kHz pilot is broadcast at a fixed level (~9% of deviation),
+        # so comparing pilot power to noise floor gives a consistent metric.
         if self.noise_bpf is not None:
             noise_filtered, self.noise_bpf_state = signal.lfilter(
                 self.noise_bpf, 1.0, baseband, zi=self.noise_bpf_state
             )
             noise_power = np.mean(noise_filtered ** 2)
-            # Scale noise to audio bandwidth (noise power density * bandwidth)
-            noise_power_scaled = noise_power * (audio_bandwidth / self.noise_bandwidth)
 
-            # Smooth the measurements
-            self._signal_power = 0.9 * self._signal_power + 0.1 * signal_power
-            self._noise_power = 0.9 * self._noise_power + 0.1 * max(noise_power_scaled, 1e-12)
+            # Pilot power from the smoothed pilot level (already RMS, square for power)
+            pilot_power = self._pilot_level ** 2
 
-            # Calculate SNR in dB
-            if self._noise_power > 0:
-                self._snr_db = 10 * np.log10(self._signal_power / self._noise_power)
+            # Normalize noise to pilot bandwidth for fair comparison
+            # Pilot BPF: 1 kHz, Noise BPF: 10 kHz
+            noise_in_pilot_bw = noise_power * (self.pilot_bandwidth / self.noise_bandwidth)
+
+            # Smooth the noise measurement
+            self._noise_power = 0.9 * self._noise_power + 0.1 * max(noise_in_pilot_bw, 1e-12)
+
+            # Calculate SNR in dB (pilot power vs noise in same bandwidth)
+            if self._noise_power > 0 and pilot_power > 0:
+                self._snr_db = 10 * np.log10(pilot_power / self._noise_power)
 
         if profiling:
             t0 = self._prof('noise_bpf', t0)
 
-        # Resample to audio rate
-        if self.gpu_resampler is not None:
-            left, right = self.gpu_resampler.resample(left, right)
+        # Resample to audio rate with adaptive rate control
+        # Adjusts output length to compensate for clock drift between IQ source and audio card
+        nominal_output = int(round(len(left) * self._nominal_ratio))
+        adjusted_output = int(round(nominal_output * self._rate_adjust))
+        if adjusted_output > 0:
+            left = signal.resample(left, adjusted_output)
+            right = signal.resample(right, adjusted_output)
         else:
-            left = signal.resample_poly(left, self.resample_up, self.resample_down)
-            right = signal.resample_poly(right, self.resample_up, self.resample_down)
+            left = np.array([], dtype=np.float64)
+            right = np.array([], dtype=np.float64)
 
         if profiling:
             t0 = self._prof('resample', t0)
@@ -778,7 +805,6 @@ class FMStereoDecoder:
 
         # Reset SNR state
         self._snr_db = 0.0
-        self._signal_power = 0.0
         self._noise_power = 1e-10
         self._peak_amplitude = 0.0
         self._blend_factor = 1.0  # Start at full stereo
@@ -825,6 +851,10 @@ class NBFMDecoder:
         g = gcd(iq_int, audio_int)
         self.resample_up = audio_int // g
         self.resample_down = iq_int // g
+
+        # Adaptive rate control (same as FMStereoDecoder)
+        self._rate_adjust = 1.0
+        self._nominal_ratio = audio_sample_rate / iq_sample_rate
 
         # Design filters (all at IQ sample rate)
         nyq = iq_sample_rate / 2
@@ -932,6 +962,16 @@ class NBFMDecoder:
         return 0.0
 
     @property
+    def rate_adjust(self):
+        """Return current rate adjustment factor for adaptive resampling."""
+        return self._rate_adjust
+
+    @rate_adjust.setter
+    def rate_adjust(self, value):
+        """Set rate adjustment factor (0.99-1.01 typical range for clock drift)."""
+        self._rate_adjust = max(0.98, min(1.02, value))
+
+    @property
     def last_baseband(self):
         """Returns None - NBFM doesn't provide baseband for RDS."""
         return None
@@ -981,8 +1021,14 @@ class NBFMDecoder:
             if self._noise_power > 0:
                 self._snr_db = 10 * np.log10(self._signal_power / self._noise_power)
 
-        # Resample to audio rate
-        audio = signal.resample_poly(audio, self.resample_up, self.resample_down)
+        # Resample to audio rate with adaptive rate control
+        # Adjusts output length to compensate for clock drift
+        nominal_output = int(round(len(audio) * self._nominal_ratio))
+        adjusted_output = int(round(nominal_output * self._rate_adjust))
+        if adjusted_output > 0:
+            audio = signal.resample(audio, adjusted_output)
+        else:
+            audio = np.array([], dtype=np.float64)
 
         # Scale down to provide headroom for tone controls
         audio = audio * 0.5

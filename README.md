@@ -182,7 +182,7 @@ output = tanh(input * 1.5) / tanh(1.5)
 
 **S-Meter**: Calibrated to VHF/UHF standard (S9 = -93 dBm, 6 dB/S-unit)
 
-**SNR Estimation**: Measured by comparing signal power (0-53 kHz) to noise power in an out-of-band region (75-95 kHz), scaled by bandwidth ratio.
+**SNR Estimation**: Pilot-referenced measurement comparing 19 kHz pilot power to noise floor at 205-225 kHz (beyond HD Radio sidebands, true noise floor). The pilot is broadcast at a fixed level (~9% of deviation), providing a consistent reference.
 
 ## Usage
 

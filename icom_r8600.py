@@ -285,6 +285,7 @@ class IcomR8600:
 
         # I/Q data buffer and thread
         self._iq_buffer = []
+        self._iq_byte_buf = bytearray()  # Persistent byte buffer for parsing
         self._iq_lock = threading.Lock()
         self._iq_thread = None
         self._running = False
@@ -470,6 +471,9 @@ class IcomR8600:
         self.iq_bandwidth = chosen_rate * 0.87
         self.streaming_mode = "iq"
 
+        # Initialize buffers for new streaming session
+        self._iq_byte_buf = bytearray()
+
         # Start I/Q reader thread
         self._running = True
         self._iq_buffer = []
@@ -499,139 +503,122 @@ class IcomR8600:
         """
         Fetch IQ samples for software demodulation.
 
+        Uses byte-level parsing with sync pattern detection to handle
+        sync patterns that may straddle USB read boundaries.
+
         Args:
             num_samples: Number of IQ samples to fetch
 
         Returns:
-            numpy array of complex64 IQ samples
+            numpy array of complex64 IQ samples (always exactly num_samples, padded with zeros if needed)
         """
         if self.streaming_mode != "iq":
             raise RuntimeError("Device not in IQ streaming mode")
 
-        bytes_needed = num_samples * self._bytes_per_sample
-        collected = b''
+        # Define sync pattern and sample parameters based on bit depth
+        if self._bit_depth == 16:
+            sync_bytes = b"\x00\x80\x00\x80"
+            sample_size = 4
+        else:
+            sync_bytes = b"\x00\x80\x01\x00\x80\x02"
+            sample_size = 6
 
-        # Collect enough data from buffer
-        timeout = time.time() + 1.0  # 1 second timeout
-        while len(collected) < bytes_needed and time.time() < timeout:
+        bytes_needed = num_samples * sample_size + len(sync_bytes) * (num_samples // 1024 + 2)
+
+        # Collect raw bytes from USB reader thread
+        timeout = time.time() + 1.0
+        while len(self._iq_byte_buf) < bytes_needed and time.time() < timeout:
             with self._iq_lock:
-                while self._iq_buffer and len(collected) < bytes_needed:
-                    chunk = self._iq_buffer.pop(0)
-                    collected += chunk
-            if len(collected) < bytes_needed:
+                while self._iq_buffer:
+                    self._iq_byte_buf += self._iq_buffer.pop(0)
+            if len(self._iq_byte_buf) < bytes_needed:
                 time.sleep(0.001)
 
-        if len(collected) < bytes_needed:
-            # Not enough data - return what we have padded with zeros
+        # Parse samples from byte buffer
+        buf = self._iq_byte_buf
+        idx = 0
+        buf_len = len(buf)
+        parsed_i = []
+        parsed_q = []
+
+        while len(parsed_i) < num_samples and buf_len - idx >= sample_size:
+            # Check for and skip sync patterns
+            if buf[idx:idx + len(sync_bytes)] == sync_bytes:
+                idx += len(sync_bytes)
+                continue
+
+            if self._bit_depth == 16:
+                i = int.from_bytes(buf[idx:idx + 2], "little", signed=True)
+                q = int.from_bytes(buf[idx + 2:idx + 4], "little", signed=True)
+                idx += 4
+                # Filter invalid samples (value -32768 only appears in sync)
+                if i == -32768 or q == -32768:
+                    continue
+            else:
+                i_raw = buf[idx:idx + 3]
+                q_raw = buf[idx + 3:idx + 6]
+                idx += 6
+                # 24-bit little-endian to int
+                i = i_raw[0] | (i_raw[1] << 8) | (i_raw[2] << 16)
+                q = q_raw[0] | (q_raw[1] << 8) | (q_raw[2] << 16)
+                # Sign extend from 24-bit
+                if i & 0x800000:
+                    i -= 0x1000000
+                if q & 0x800000:
+                    q -= 0x1000000
+                # Filter invalid samples
+                if i < -8387967 or i > 8387966 or q < -8387967 or q > 8387966:
+                    continue
+
+            parsed_i.append(i)
+            parsed_q.append(q)
+
+        # Remove parsed bytes from buffer
+        if idx > 0:
+            self._iq_byte_buf = self._iq_byte_buf[idx:]
+
+        # Convert to complex samples
+        if parsed_i:
+            if self._bit_depth == 16:
+                i_arr = np.asarray(parsed_i, dtype=np.int16).astype(np.float32)
+                q_arr = np.asarray(parsed_q, dtype=np.int16).astype(np.float32)
+                iq = (i_arr + 1j * q_arr) / 32768.0
+            else:
+                i_arr = np.asarray(parsed_i, dtype=np.int32).astype(np.float32)
+                q_arr = np.asarray(parsed_q, dtype=np.int32).astype(np.float32)
+                iq = (i_arr + 1j * q_arr) / 8388608.0
+
+            # Remove DC offset (per Icom I/Q Reference Guide)
+            block_dc = np.mean(iq)
+            self._dc_offset = self._dc_alpha * block_dc + (1 - self._dc_alpha) * self._dc_offset
+            iq = iq - self._dc_offset
+
+            # Apply gain
+            if self._iq_gain != 1.0:
+                iq = iq * self._iq_gain
+
+            iq = iq.astype(np.complex64)
+        else:
+            iq = np.zeros(0, dtype=np.complex64)
+
+        # Track sample loss
+        if len(iq) < num_samples:
             self.recent_sample_loss += 1
             self.total_sample_loss += 1
-
-        # Parse I/Q data based on bit depth
-        if self._bit_depth == 16:
-            # 16-bit: I16 Q16 (4 bytes per sample)
-            samples_available = len(collected) // 4
-            samples_to_use = min(samples_available, num_samples)
-
-            if samples_to_use > 0:
-                raw = np.frombuffer(collected[:samples_to_use * 4], dtype=np.int16)
-                # Reshape to (N, 2) then view as interleaved I, Q
-                iq_int = raw.reshape(-1, 2)
-
-                # Filter out sync patterns and invalid samples
-                # Per Icom I/Q Reference: valid range is -32767 to +32767
-                # Value -32768 (0x8000) only appears in sync patterns
-                # Sync pattern for 16-bit: 0x8000, 0x8000 every 1024 samples
-                # Filter any sample where I OR Q is -32768 (invalid/sync)
-                invalid_mask = (iq_int[:, 0] == -32768) | (iq_int[:, 1] == -32768)
-                if np.any(invalid_mask):
-                    iq_int = iq_int[~invalid_mask]
-
-                # Convert to complex64, normalizing to [-1, 1]
-                iq = (iq_int[:, 0].astype(np.float32) + 1j * iq_int[:, 1].astype(np.float32)) / 32768.0
-
-                # Remove DC offset (per Icom I/Q Reference Guide, DC component exists)
-                # Update DC estimate with exponential moving average
-                block_dc = np.mean(iq)
-                self._dc_offset = self._dc_alpha * block_dc + (1 - self._dc_alpha) * self._dc_offset
-                iq = iq - self._dc_offset
-
-                # Apply gain (should be 1.0 for FM since demod is phase-based)
-                if self._iq_gain != 1.0:
-                    iq = iq * self._iq_gain
-            else:
-                iq = np.zeros(0, dtype=np.complex64)
-
-            # Pad if needed
-            if len(iq) < num_samples:
-                iq = np.concatenate([iq, np.zeros(num_samples - len(iq), dtype=np.complex64)])
-
         else:
-            # 24-bit: I24 Q24 (6 bytes per sample)
-            samples_available = len(collected) // 6
-            samples_to_use = min(samples_available, num_samples)
+            self.recent_sample_loss = 0
 
-            if samples_to_use > 0:
-                # Parse 24-bit samples using numpy for efficiency
-                # Each sample is 6 bytes: I0 I1 I2 Q0 Q1 Q2 (little-endian)
-                raw = np.frombuffer(collected[:samples_to_use * 6], dtype=np.uint8)
-                raw = raw.reshape(-1, 6)
+        # Pad with zeros if we didn't get enough samples
+        if len(iq) < num_samples:
+            iq = np.concatenate([iq, np.zeros(num_samples - len(iq), dtype=np.complex64)])
 
-                # Extract I and Q as 24-bit values (little-endian)
-                # Combine bytes: val = b0 | (b1 << 8) | (b2 << 16)
-                i_vals = (raw[:, 0].astype(np.int32) |
-                          (raw[:, 1].astype(np.int32) << 8) |
-                          (raw[:, 2].astype(np.int32) << 16))
-                q_vals = (raw[:, 3].astype(np.int32) |
-                          (raw[:, 4].astype(np.int32) << 8) |
-                          (raw[:, 5].astype(np.int32) << 16))
-
-                # Sign extend from 24-bit to 32-bit
-                i_vals = np.where(i_vals & 0x800000, i_vals - 0x1000000, i_vals)
-                q_vals = np.where(q_vals & 0x800000, q_vals - 0x1000000, q_vals)
-
-                # Filter out sync patterns per Icom I/Q Reference Guide:
-                # 24-bit sync is 6 bytes: 0x8000, 0x8001, 0x8002 (as 16-bit words)
-                # When parsed as 24-bit I/Q: I=0x018000=98304, Q=0x800280→-8387968
-                # Valid I/Q range is -8387967 to +8387966, so Q < -8387967 indicates sync
-                # Also check for I matching sync pattern (I == 98304 AND Q == -8387968)
-                sync_mask = (i_vals == 98304) & (q_vals == -8387968)
-                if np.any(sync_mask):
-                    i_vals = i_vals[~sync_mask]
-                    q_vals = q_vals[~sync_mask]
-
-                # Convert to complex64, normalizing to [-1, 1]
-                # Normalize by 8388608 (2^23) for full 24-bit range
-                iq = (i_vals.astype(np.float32) + 1j * q_vals.astype(np.float32)) / 8388608.0
-
-                # Remove DC offset (per Icom I/Q Reference Guide, DC component exists)
-                # Update DC estimate with exponential moving average
-                block_dc = np.mean(iq)
-                self._dc_offset = self._dc_alpha * block_dc + (1 - self._dc_alpha) * self._dc_offset
-                iq = iq - self._dc_offset
-
-                # Apply gain (should be 1.0 for FM since demod is phase-based)
-                if self._iq_gain != 1.0:
-                    iq = iq * self._iq_gain
-            else:
-                iq = np.zeros(0, dtype=np.complex64)
-
-            # Pad if needed
-            if len(iq) < num_samples:
-                iq = np.concatenate([iq, np.zeros(num_samples - len(iq), dtype=np.complex64)])
-
-        # Put excess data back in buffer
-        excess_bytes = len(collected) - (num_samples * self._bytes_per_sample)
-        if excess_bytes > 0:
-            with self._iq_lock:
-                self._iq_buffer.insert(0, collected[-(excess_bytes):])
-
-        self.recent_sample_loss = 0
         return iq[:num_samples]
 
     def flush_iq(self):
         """Flush stale IQ data from the buffer."""
         with self._iq_lock:
             self._iq_buffer.clear()
+        self._iq_byte_buf = bytearray()
         # Reset DC offset estimate (DC varies with frequency per Icom docs)
         self._dc_offset = 0.0 + 0.0j
         self.total_sample_loss = 0
