@@ -1556,6 +1556,12 @@ def build_display(radio, width=80):
         buf_text.append("░" * (bar_width - filled), style="dim")
         buf_text.append("]", style="dim")
 
+        # Add rate control adjustment (ppm)
+        rc_stats = radio.audio_player.rate_control_stats
+        buf_error = rc_stats['current_ms'] - rc_stats['target_ms']
+        rate_ppm = -buf_error * 10  # 10 ppm per ms error
+        buf_text.append(f"  adj:{rate_ppm:+.0f}ppm", style="green bold")
+
         table.add_row("Buffer:", buf_text)
 
         # Peak amplitude display
@@ -1610,22 +1616,6 @@ def build_display(radio, width=80):
         else:
             loss_text.append("0", style="green bold")
         table.add_row("IQ Loss:", loss_text)
-
-        # Adaptive rate control stats
-        rc_stats = radio.audio_player.rate_control_stats
-        rc_text = Text()
-        buf_level = rc_stats['current_ms']
-        buf_target = rc_stats['target_ms']
-        buf_error = buf_level - buf_target
-        rate_ppm = -buf_error * 10  # 10 ppm per ms error
-        rc_text.append(f"buf:{buf_level:.0f}ms", style="dim")
-        rc_text.append(f"  target:{buf_target:.0f}ms", style="dim")
-        # Show rate adjustment as ppm deviation from nominal
-        if abs(buf_error) < 20:
-            rc_text.append(f"  adj:{rate_ppm:+.0f}ppm", style="green")
-        else:
-            rc_text.append(f"  adj:{rate_ppm:+.0f}ppm", style="yellow")
-        table.add_row("Rate Ctl:", rc_text)
 
         # RDS coherent demod diagnostics (when enabled)
         if not radio.weather_mode and radio.rds_decoder and radio.rds_decoder._diag_enabled:
