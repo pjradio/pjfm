@@ -1616,14 +1616,26 @@ def build_display(radio, width=80):
         else:
             loss_text.append("0", style="green bold")
 
-        # Sync debug (IC-R8600 only) - format: sync:misses/aligns
+        # Sync debug (IC-R8600 only) - format: sync:misses/aligns/invalid24
         sync_misses = getattr(radio.device, '_sync_misses', 0)
         initial_aligns = getattr(radio.device, '_initial_aligns', 0)
-        if sync_misses > 0 or initial_aligns > 0:
+        invalid_24 = getattr(radio.device, '_sync_invalid_24', 0)
+        if sync_misses > 0 or initial_aligns > 0 or invalid_24 > 0:
             loss_text.append(f"  sync:{sync_misses}", style="red bold" if sync_misses else "green bold")
             loss_text.append(f"/{initial_aligns}", style="cyan bold")
+            loss_text.append(f"/{invalid_24}", style="magenta bold" if invalid_24 else "cyan bold")
         elif radio.use_icom:
-            loss_text.append("  sync:0/0", style="green bold")
+            loss_text.append("  sync:0/0/0", style="green bold")
+
+        if radio.use_icom:
+            fetch_slow = getattr(radio.device, '_fetch_slow_count', 0)
+            fetch_last_ms = getattr(radio.device, '_fetch_last_ms', 0.0)
+            fetch_thresh = getattr(radio.device, '_fetch_slow_threshold_ms', 0.0)
+            civ_timeouts = getattr(radio.device, '_civ_timeouts', 0)
+            loss_text.append(f"  fetch:{fetch_slow}", style="red bold" if fetch_slow else "green bold")
+            fetch_style = "red bold" if fetch_thresh and fetch_last_ms > fetch_thresh else "cyan bold"
+            loss_text.append(f"/{fetch_last_ms:.0f}ms", style=fetch_style)
+            loss_text.append(f"  civ:{civ_timeouts}", style="red bold" if civ_timeouts else "green bold")
 
         table.add_row("IQ Loss:", loss_text)
 

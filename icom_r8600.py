@@ -306,6 +306,11 @@ class IcomR8600:
         self._flush_during_fetch = 0  # Counter for flush while fetch_iq active
         self._fetch_active = False  # Flag to track if fetch_iq is running
         self._initial_aligns = 0  # Counter for initial alignment attempts
+        self._sync_invalid_24 = 0  # Counter for 24-bit samples rejected as invalid
+        self._fetch_last_ms = 0.0  # Last fetch_iq duration in ms
+        self._fetch_slow_count = 0  # Count of slow fetch_iq calls
+        self._fetch_slow_threshold_ms = 50.0  # Slow fetch threshold in ms
+        self._civ_timeouts = 0  # Count of CI-V response timeouts
         self._iq_lock = threading.Lock()
         self._iq_thread = None
         self._running = False
@@ -419,6 +424,7 @@ class IcomR8600:
             response = self.device.read(EP_RESP_IN, 64, timeout=timeout)
             return bytes(response)
         except usb.core.USBTimeoutError:
+            self._civ_timeouts += 1
             return None
         except usb.core.USBError as e:
             raise RuntimeError(f"Failed to read response: {e}")
@@ -550,6 +556,7 @@ class IcomR8600:
         if self.streaming_mode != "iq":
             raise RuntimeError("Device not in IQ streaming mode")
 
+        start_time = time.perf_counter()
         self._fetch_active = True
 
         # Define sync pattern and sample parameters based on bit depth
@@ -619,6 +626,10 @@ class IcomR8600:
 
             if not self._iq_aligned:
                 # Still no sync after timeout - return zeros
+                duration_ms = (time.perf_counter() - start_time) * 1000.0
+                self._fetch_last_ms = duration_ms
+                if duration_ms > self._fetch_slow_threshold_ms:
+                    self._fetch_slow_count += 1
                 self._fetch_active = False
                 return np.zeros(num_samples, dtype=np.complex64)
 
@@ -632,13 +643,28 @@ class IcomR8600:
 
         # Get expected sync interval for this sample rate
         sync_interval = SYNC_INTERVAL.get(self.iq_sample_rate, 1024)
+        expected_gap = sync_interval * sample_size  # bytes between sync patterns
 
         while len(parsed_i) < num_samples and buf_len - idx >= sample_size:
             # Check for sync pattern at current position
             if buf[idx:idx + sync_len] == sync_bytes:
-                idx += sync_len
-                self._samples_since_sync = 0
-                continue
+                if self._bit_depth == 24 and 0 < self._samples_since_sync < sync_interval:
+                    # Early sync in 24-bit: verify next sync before accepting
+                    next_sync_pos = idx + sync_len + expected_gap
+                    if next_sync_pos + sync_len > buf_len:
+                        # Need more data to verify; stop parsing for now
+                        break
+                    if buf[next_sync_pos:next_sync_pos + sync_len] != sync_bytes:
+                        # Likely false sync; treat as data
+                        pass
+                    else:
+                        idx += sync_len
+                        self._samples_since_sync = 0
+                        continue
+                else:
+                    idx += sync_len
+                    self._samples_since_sync = 0
+                    continue
 
             # Periodic alignment check: if we've parsed enough samples,
             # we should be near a sync. If not at expected position, search for it.
@@ -676,6 +702,8 @@ class IcomR8600:
                 i = int.from_bytes(buf[idx:idx + 2], "little", signed=True)
                 q = int.from_bytes(buf[idx + 2:idx + 4], "little", signed=True)
                 idx += 4
+                # Track samples consumed, even if later discarded
+                self._samples_since_sync += 1
                 # Filter invalid samples (value -32768 only appears in sync)
                 if i == -32768 or q == -32768:
                     continue
@@ -683,6 +711,8 @@ class IcomR8600:
                 i_raw = buf[idx:idx + 3]
                 q_raw = buf[idx + 3:idx + 6]
                 idx += 6
+                # Track samples consumed, even if later discarded
+                self._samples_since_sync += 1
                 # 24-bit little-endian to int
                 i = i_raw[0] | (i_raw[1] << 8) | (i_raw[2] << 16)
                 q = q_raw[0] | (q_raw[1] << 8) | (q_raw[2] << 16)
@@ -694,9 +724,8 @@ class IcomR8600:
                 # Per Icom spec, valid range is -8387967 to +8387966
                 # Values outside this are likely sync bytes misinterpreted
                 if i < -8387967 or i > 8387966 or q < -8387967 or q > 8387966:
+                    self._sync_invalid_24 += 1
                     continue
-
-            self._samples_since_sync += 1
             parsed_i.append(i)
             parsed_q.append(q)
 
@@ -739,6 +768,10 @@ class IcomR8600:
         if len(iq) < num_samples:
             iq = np.concatenate([iq, np.zeros(num_samples - len(iq), dtype=np.complex64)])
 
+        duration_ms = (time.perf_counter() - start_time) * 1000.0
+        self._fetch_last_ms = duration_ms
+        if duration_ms > self._fetch_slow_threshold_ms:
+            self._fetch_slow_count += 1
         self._fetch_active = False
         return iq[:num_samples]
 
