@@ -555,20 +555,21 @@ class FMRadio:
     # Config file path (in same directory as script)
     CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'pyfm.cfg')
 
-    def __init__(self, initial_freq=89.9e6, use_icom=False):
+    def __init__(self, initial_freq=89.9e6, use_icom=False, use_24bit=False):
         """
         Initialize FM Radio.
 
         Args:
             initial_freq: Initial frequency in Hz
             use_icom: If True, use IC-R8600 instead of BB60D
+            use_24bit: If True, use 24-bit I/Q samples (IC-R8600 only)
         """
         self.use_icom = use_icom
 
         if use_icom:
             if IcomR8600 is None:
                 raise RuntimeError("IC-R8600 support not available. Check icom_r8600.py and pyusb installation.")
-            self.device = IcomR8600()
+            self.device = IcomR8600(use_24bit=use_24bit)
         else:
             if BB60D is None:
                 raise RuntimeError("BB60D support not available. Check bb60d.py and BB API installation.")
@@ -1366,11 +1367,14 @@ def build_display(radio, width=80):
             freq_text.append(f"  ({wx_ch})", style="cyan bold")
     table.add_row("Frequency:", freq_text)
 
-    # Mode row
+    # Mode row - include bit depth for IC-R8600
+    bit_depth_suffix = ""
+    if hasattr(radio.device, '_bit_depth') and radio.device._bit_depth == 24:
+        bit_depth_suffix = " [24-bit]"
     if radio.weather_mode:
-        table.add_row("Mode:", "NBFM Weather Radio (5 kHz dev)")
+        table.add_row("Mode:", f"NBFM Weather Radio (5 kHz dev){bit_depth_suffix}")
     else:
-        table.add_row("Mode:", "Wideband FM Stereo (75 kHz dev)")
+        table.add_row("Mode:", f"Wideband FM Stereo (75 kHz dev){bit_depth_suffix}")
 
     # Volume row
     vol_pct = int(radio.volume * 100)
@@ -2076,6 +2080,12 @@ def main():
         action="store_true",
         help="Enable real-time scheduling (requires sudo or CAP_SYS_NICE)"
     )
+    parser.add_argument(
+        "--24bit",
+        action="store_true",
+        dest="use_24bit",
+        help="Use 24-bit I/Q samples (IC-R8600 only)"
+    )
 
     args = parser.parse_args()
 
@@ -2142,8 +2152,13 @@ def main():
     elif args.bb60d:
         use_icom = False
 
+    # Validate --24bit requires Icom
+    if args.use_24bit and not use_icom:
+        print("Error: --24bit requires IC-R8600 (use --icom)")
+        sys.exit(1)
+
     # Create radio instance
-    radio = FMRadio(initial_freq=initial_freq, use_icom=use_icom)
+    radio = FMRadio(initial_freq=initial_freq, use_icom=use_icom, use_24bit=args.use_24bit)
 
     # Run rich UI
     try:

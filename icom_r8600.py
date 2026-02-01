@@ -59,6 +59,17 @@ SAMPLE_RATES_24BIT = {
     240000:  (0x01, 0x06),  # 240 KSPS, 24-bit
 }
 
+# Sync pattern interval (samples between sync markers) per Icom I/Q Reference Guide
+# Used to verify alignment - if we don't see sync at expected interval, we're misaligned
+SYNC_INTERVAL = {
+    5120000: 10923,  # 16-bit only
+    3840000: 8192,
+    1920000: 4096,
+    960000:  2048,
+    480000:  1024,
+    240000:  512,
+}
+
 
 def _build_civ_command(cmd_data):
     """Build a CI-V command packet with even-length padding."""
@@ -258,7 +269,7 @@ class IcomR8600:
 
     DEFAULT_FREQ = 89.9e6
 
-    def __init__(self):
+    def __init__(self, use_24bit=False):
         self.device = None
         self.frequency = self.DEFAULT_FREQ
         self.streaming_mode = None
@@ -268,6 +279,7 @@ class IcomR8600:
         # I/Q streaming state
         self.iq_sample_rate = 0
         self.iq_bandwidth = 0
+        self._use_24bit = use_24bit
         self._bit_depth = 16
         self._bytes_per_sample = 4  # 16-bit: 2 bytes I + 2 bytes Q
 
@@ -286,6 +298,8 @@ class IcomR8600:
         # I/Q data buffer and thread
         self._iq_buffer = []
         self._iq_byte_buf = bytearray()  # Persistent byte buffer for parsing
+        self._iq_aligned = False  # Whether stream is aligned to sample boundaries
+        self._samples_since_sync = 0  # Counter for sync interval verification
         self._iq_lock = threading.Lock()
         self._iq_thread = None
         self._running = False
@@ -418,7 +432,13 @@ class IcomR8600:
 
         # Find nearest available sample rate
         # For FM, we need at least 250 kHz, so 480 KSPS is minimum
-        available_rates = sorted(SAMPLE_RATES.keys())
+        # Select rate table based on bit depth preference
+        if self._use_24bit:
+            rate_table = SAMPLE_RATES_24BIT
+        else:
+            rate_table = SAMPLE_RATES
+
+        available_rates = sorted(rate_table.keys())
         chosen_rate = available_rates[0]
         for rate in available_rates:
             if rate >= sample_rate:
@@ -427,7 +447,7 @@ class IcomR8600:
         else:
             chosen_rate = available_rates[-1]  # Use highest if requested is higher
 
-        bit_depth, rate_code = SAMPLE_RATES[chosen_rate]
+        bit_depth, rate_code = rate_table[chosen_rate]
         self._bit_depth = 16 if bit_depth == 0x00 else 24
         self._bytes_per_sample = 4 if self._bit_depth == 16 else 6
 
@@ -473,6 +493,8 @@ class IcomR8600:
 
         # Initialize buffers for new streaming session
         self._iq_byte_buf = bytearray()
+        self._iq_aligned = False
+        self._samples_since_sync = 0
 
         # Start I/Q reader thread
         self._running = True
@@ -516,11 +538,14 @@ class IcomR8600:
             raise RuntimeError("Device not in IQ streaming mode")
 
         # Define sync pattern and sample parameters based on bit depth
+        # Per Icom I/Q Reference Guide:
+        # 16-bit sync: 0x8000, 0x8000 (little-endian: 00 80 00 80)
+        # 24-bit sync: 0x8000, 0x8001, 0x8002 (little-endian: 00 80 01 80 02 80)
         if self._bit_depth == 16:
             sync_bytes = b"\x00\x80\x00\x80"
             sample_size = 4
         else:
-            sync_bytes = b"\x00\x80\x01\x00\x80\x02"
+            sync_bytes = b"\x00\x80\x01\x80\x02\x80"
             sample_size = 6
 
         bytes_needed = num_samples * sample_size + len(sync_bytes) * (num_samples // 1024 + 2)
@@ -534,18 +559,76 @@ class IcomR8600:
             if len(self._iq_byte_buf) < bytes_needed:
                 time.sleep(0.001)
 
-        # Parse samples from byte buffer
+        # Align to sample boundary on first parse (critical for 24-bit)
+        # 16-bit mode works without explicit alignment; 24-bit requires it
+        if self._bit_depth == 24 and not self._iq_aligned:
+            while time.time() < timeout:
+                # Collect more data if needed
+                with self._iq_lock:
+                    while self._iq_buffer:
+                        self._iq_byte_buf += self._iq_buffer.pop(0)
+
+                idx = self._iq_byte_buf.find(sync_bytes)
+                if idx != -1:
+                    # Found sync - skip past it to align
+                    self._iq_byte_buf = self._iq_byte_buf[idx + len(sync_bytes):]
+                    self._iq_aligned = True
+                    break
+
+                # Keep tail bytes that might be start of sync pattern
+                keep = max(0, len(sync_bytes) - 1)
+                if len(self._iq_byte_buf) > keep:
+                    self._iq_byte_buf = self._iq_byte_buf[-keep:]
+                time.sleep(0.001)
+
+            if not self._iq_aligned:
+                # Still no sync after timeout - return zeros
+                return np.zeros(num_samples, dtype=np.complex64)
+
+        # Parse samples from byte buffer using sync-based framing
         buf = self._iq_byte_buf
         idx = 0
         buf_len = len(buf)
         parsed_i = []
         parsed_q = []
+        sync_len = len(sync_bytes)
+
+        # Get expected sync interval for this sample rate
+        sync_interval = SYNC_INTERVAL.get(self.iq_sample_rate, 1024)
 
         while len(parsed_i) < num_samples and buf_len - idx >= sample_size:
-            # Check for and skip sync patterns
-            if buf[idx:idx + len(sync_bytes)] == sync_bytes:
-                idx += len(sync_bytes)
+            # Check for sync pattern at current position
+            if buf[idx:idx + sync_len] == sync_bytes:
+                idx += sync_len
+                self._samples_since_sync = 0
                 continue
+
+            # Periodic alignment check: if we've parsed enough samples,
+            # we should be near a sync. If not at expected position, search for it.
+            if self._samples_since_sync > 0 and self._samples_since_sync >= sync_interval:
+                # We should have seen a sync by now - search for it
+                sync_pos = buf[idx:idx + sync_len * 3].find(sync_bytes)
+                if sync_pos == -1:
+                    # No sync where expected - we're misaligned, search further
+                    sync_pos = buf[idx:].find(sync_bytes)
+                    if sync_pos != -1:
+                        idx += sync_pos + sync_len
+                        self._samples_since_sync = 0
+                        continue
+                    else:
+                        # No sync in buffer - skip some bytes and try again
+                        idx += sample_size
+                        continue
+                elif sync_pos == 0:
+                    # Sync right here - good
+                    idx += sync_len
+                    self._samples_since_sync = 0
+                    continue
+                else:
+                    # Sync nearby but not at position 0 - we drifted
+                    idx += sync_pos + sync_len
+                    self._samples_since_sync = 0
+                    continue
 
             if self._bit_depth == 16:
                 i = int.from_bytes(buf[idx:idx + 2], "little", signed=True)
@@ -566,10 +649,12 @@ class IcomR8600:
                     i -= 0x1000000
                 if q & 0x800000:
                     q -= 0x1000000
-                # Filter invalid samples
+                # Per Icom spec, valid range is -8387967 to +8387966
+                # Values outside this are likely sync bytes misinterpreted
                 if i < -8387967 or i > 8387966 or q < -8387967 or q > 8387966:
                     continue
 
+            self._samples_since_sync += 1
             parsed_i.append(i)
             parsed_q.append(q)
 
@@ -619,6 +704,8 @@ class IcomR8600:
         with self._iq_lock:
             self._iq_buffer.clear()
         self._iq_byte_buf = bytearray()
+        self._iq_aligned = False  # Force re-alignment after flush
+        self._samples_since_sync = 0
         # Reset DC offset estimate (DC varies with frequency per Icom docs)
         self._dc_offset = 0.0 + 0.0j
         self.total_sample_loss = 0
