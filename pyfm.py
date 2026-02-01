@@ -942,8 +942,8 @@ class FMRadio:
                 new_freq = self.device.frequency + 25000
                 if new_freq > 162.550e6:
                     new_freq = 162.400e6  # Wrap around
-                self.device.frequency = new_freq
-                self.device.configure_iq_streaming(new_freq, self.IQ_SAMPLE_RATE)
+                self.device.set_frequency(new_freq)
+                self.device.flush_iq()
                 self.nbfm_decoder.reset()
             else:
                 # FM broadcast: 100 kHz steps
@@ -967,8 +967,8 @@ class FMRadio:
                 new_freq = self.device.frequency - 25000
                 if new_freq < 162.400e6:
                     new_freq = 162.550e6  # Wrap around
-                self.device.frequency = new_freq
-                self.device.configure_iq_streaming(new_freq, self.IQ_SAMPLE_RATE)
+                self.device.set_frequency(new_freq)
+                self.device.flush_iq()
                 self.nbfm_decoder.reset()
             else:
                 # FM broadcast: 100 kHz steps
@@ -995,8 +995,8 @@ class FMRadio:
         self.is_tuning = True
         self.error_message = None
         with self.tuning_lock:
-            self.device.frequency = freq_hz
-            self.device.configure_iq_streaming(freq_hz, self.IQ_SAMPLE_RATE)
+            self.device.set_frequency(freq_hz)
+            self.device.flush_iq()
             if self.weather_mode:
                 self.nbfm_decoder.reset()
             else:
@@ -1115,8 +1115,8 @@ class FMRadio:
             if self.weather_mode:
                 # Switch to weather mode: tune to WX1 (162.550 MHz)
                 freq = WX_CHANNELS[1]
-                self.device.frequency = freq
-                self.device.configure_iq_streaming(freq, self.IQ_SAMPLE_RATE)
+                self.device.set_frequency(freq)
+                self.device.flush_iq()
                 self.nbfm_decoder.reset()
                 # Disable RDS in weather mode
                 self.rds_enabled = False
@@ -1135,8 +1135,8 @@ class FMRadio:
                                 freq = freq_mhz * 1e6
                     except (ValueError, configparser.Error):
                         pass
-                self.device.frequency = freq
-                self.device.configure_iq_streaming(freq, self.IQ_SAMPLE_RATE)
+                self.device.set_frequency(freq)
+                self.device.flush_iq()
                 self.stereo_decoder.reset()
                 if self.rds_decoder:
                     self.rds_decoder.reset()
@@ -1616,12 +1616,14 @@ def build_display(radio, width=80):
         else:
             loss_text.append("0", style="green bold")
 
-        # Sync misses (IC-R8600 only) - append to loss line
+        # Sync debug (IC-R8600 only) - format: sync:misses/aligns
         sync_misses = getattr(radio.device, '_sync_misses', 0)
-        if sync_misses > 0:
-            loss_text.append(f"  sync:{sync_misses}", style="red bold")
+        initial_aligns = getattr(radio.device, '_initial_aligns', 0)
+        if sync_misses > 0 or initial_aligns > 0:
+            loss_text.append(f"  sync:{sync_misses}", style="red bold" if sync_misses else "green bold")
+            loss_text.append(f"/{initial_aligns}", style="cyan bold")
         elif radio.use_icom:
-            loss_text.append("  sync:0", style="green bold")
+            loss_text.append("  sync:0/0", style="green bold")
 
         table.add_row("IQ Loss:", loss_text)
 

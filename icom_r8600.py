@@ -302,6 +302,10 @@ class IcomR8600:
         self._iq_aligned = False  # Whether stream is aligned to sample boundaries
         self._samples_since_sync = 0  # Counter for sync interval verification
         self._sync_misses = 0  # Counter for missing sync patterns (should stay 0)
+        self._sync_short_buf = 0  # Counter for sync checks with insufficient buffer
+        self._flush_during_fetch = 0  # Counter for flush while fetch_iq active
+        self._fetch_active = False  # Flag to track if fetch_iq is running
+        self._initial_aligns = 0  # Counter for initial alignment attempts
         self._iq_lock = threading.Lock()
         self._iq_thread = None
         self._running = False
@@ -546,6 +550,8 @@ class IcomR8600:
         if self.streaming_mode != "iq":
             raise RuntimeError("Device not in IQ streaming mode")
 
+        self._fetch_active = True
+
         # Define sync pattern and sample parameters based on bit depth
         # Per Icom I/Q Reference Guide:
         # 16-bit sync: 0x8000, 0x8000 (little-endian: 00 80 00 80)
@@ -570,28 +576,50 @@ class IcomR8600:
 
         # Align to sample boundary on first parse (critical for 24-bit)
         # 16-bit mode works without explicit alignment; 24-bit requires it
+        # We verify alignment by checking that the next sync appears at expected interval
         if self._bit_depth == 24 and not self._iq_aligned:
+            sync_interval = SYNC_INTERVAL.get(self.iq_sample_rate, 1024)
+            expected_gap = sync_interval * sample_size  # bytes between sync patterns
+            search_start = 0
+
             while time.time() < timeout:
                 # Collect more data if needed
                 with self._iq_lock:
                     while self._iq_buffer:
                         self._iq_byte_buf += self._iq_buffer.pop(0)
 
-                idx = self._iq_byte_buf.find(sync_bytes)
-                if idx != -1:
-                    # Found sync - skip past it to align
+                # Find a sync pattern
+                idx = self._iq_byte_buf.find(sync_bytes, search_start)
+                if idx == -1:
+                    # No sync found - keep tail bytes that might be partial sync
+                    keep = max(0, len(sync_bytes) - 1)
+                    if len(self._iq_byte_buf) > keep:
+                        self._iq_byte_buf = self._iq_byte_buf[-keep:]
+                    search_start = 0
+                    time.sleep(0.001)
+                    continue
+
+                # Check if we have enough data to verify next sync
+                next_sync_pos = idx + len(sync_bytes) + expected_gap
+                if next_sync_pos + len(sync_bytes) > len(self._iq_byte_buf):
+                    # Need more data to verify - wait and retry
+                    time.sleep(0.001)
+                    continue
+
+                # Verify next sync is at expected position
+                if self._iq_byte_buf[next_sync_pos:next_sync_pos + len(sync_bytes)] == sync_bytes:
+                    # Verified! Position after first sync
                     self._iq_byte_buf = self._iq_byte_buf[idx + len(sync_bytes):]
                     self._iq_aligned = True
+                    self._initial_aligns += 1
                     break
-
-                # Keep tail bytes that might be start of sync pattern
-                keep = max(0, len(sync_bytes) - 1)
-                if len(self._iq_byte_buf) > keep:
-                    self._iq_byte_buf = self._iq_byte_buf[-keep:]
-                time.sleep(0.001)
+                else:
+                    # False sync - skip past it and keep searching
+                    search_start = idx + 1
 
             if not self._iq_aligned:
                 # Still no sync after timeout - return zeros
+                self._fetch_active = False
                 return np.zeros(num_samples, dtype=np.complex64)
 
         # Parse samples from byte buffer using sync-based framing
@@ -615,6 +643,9 @@ class IcomR8600:
             # Periodic alignment check: if we've parsed enough samples,
             # we should be near a sync. If not at expected position, search for it.
             if self._samples_since_sync > 0 and self._samples_since_sync >= sync_interval:
+                # Track if we have insufficient buffer for reliable sync search
+                if buf_len - idx < sync_len * 3:
+                    self._sync_short_buf += 1
                 # We should have seen a sync by now - search for it
                 sync_pos = buf[idx:idx + sync_len * 3].find(sync_bytes)
                 if sync_pos == -1:
@@ -708,10 +739,13 @@ class IcomR8600:
         if len(iq) < num_samples:
             iq = np.concatenate([iq, np.zeros(num_samples - len(iq), dtype=np.complex64)])
 
+        self._fetch_active = False
         return iq[:num_samples]
 
     def flush_iq(self):
         """Flush stale IQ data from the buffer."""
+        if self._fetch_active:
+            self._flush_during_fetch += 1
         with self._iq_lock:
             self._iq_buffer.clear()
         self._iq_byte_buf = bytearray()
