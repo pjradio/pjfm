@@ -555,7 +555,8 @@ class FMRadio:
     # Config file path (in same directory as script)
     CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'pyfm.cfg')
 
-    def __init__(self, initial_freq=89.9e6, use_icom=False, use_24bit=False, preamp=None):
+    def __init__(self, initial_freq=89.9e6, use_icom=False, use_24bit=False, preamp=None,
+                 gpu_enabled=True):
         """
         Initialize FM Radio.
 
@@ -564,8 +565,10 @@ class FMRadio:
             use_icom: If True, use IC-R8600 instead of BB60D
             use_24bit: If True, use 24-bit I/Q samples (IC-R8600 only)
             preamp: None (don't touch), True (force on), or False (force off)
+            gpu_enabled: If True, use GPU acceleration for FM demodulation
         """
         self.use_icom = use_icom
+        self.use_24bit = use_24bit
         self._preamp_setting = preamp  # None = don't touch, True = on, False = off
 
         if use_icom:
@@ -627,12 +630,12 @@ class FMRadio:
         self._initial_bass_boost = True
         self._initial_treble_boost = True
 
-        # GPU demodulator, resampler, and FIR filters (off by default)
+        # GPU demodulator, resampler, and FIR filters
         self.gpu_demod = None
         self.gpu_resampler = None
         self.gpu_fir_bank = None
         self.gpu_fir_lr_diff = None
-        self.gpu_enabled = True
+        self.gpu_enabled = gpu_enabled
 
         # Weather radio mode (NBFM for NWS)
         self.weather_mode = False
@@ -676,7 +679,9 @@ class FMRadio:
         # Radio section
         config['radio'] = {
             'last_frequency': f'{self.device.frequency / 1e6:.1f}',
-            'device': 'icom' if self.use_icom else 'bb60d'
+            'device': 'icom' if self.use_icom else 'bb60d',
+            'use_24bit': str(self.use_24bit).lower(),
+            'gpu': str(self.gpu_enabled).lower()
         }
 
         # Presets section
@@ -1181,6 +1186,7 @@ class FMRadio:
                     self.stereo_decoder.lr_diff_bpf, 1.0)
                 self.stereo_decoder.lr_diff_lpf_state = sig.lfilter_zi(
                     self.stereo_decoder.lr_diff_lpf, 1.0)
+        self._save_config()
 
     @property
     def gpu_backend(self):
@@ -2107,6 +2113,19 @@ def main():
         default=None,
         help="Force preamp on or off (IC-R8600 only, default: unchanged)"
     )
+    gpu_group = parser.add_mutually_exclusive_group()
+    gpu_group.add_argument(
+        "--gpu",
+        action="store_true",
+        dest="gpu_on",
+        help="Enable GPU acceleration (overrides config)"
+    )
+    gpu_group.add_argument(
+        "--no-gpu",
+        action="store_true",
+        dest="gpu_off",
+        help="Disable GPU acceleration (overrides config)"
+    )
 
     args = parser.parse_args()
 
@@ -2146,6 +2165,8 @@ def main():
     # Load config for defaults
     initial_freq = 89.9e6  # Default frequency
     use_icom = False  # Default device
+    use_24bit = False  # Default 16-bit I/Q
+    gpu_enabled = True  # Default GPU on
     config_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'pyfm.cfg')
     if os.path.exists(config_path):
         config = configparser.ConfigParser()
@@ -2158,6 +2179,10 @@ def main():
             if config.has_option('radio', 'device'):
                 device = config.get('radio', 'device').strip().lower()
                 use_icom = (device == 'icom')
+            if config.has_option('radio', 'use_24bit'):
+                use_24bit = config.getboolean('radio', 'use_24bit')
+            if config.has_option('radio', 'gpu'):
+                gpu_enabled = config.getboolean('radio', 'gpu')
         except (ValueError, configparser.Error):
             pass
 
@@ -2173,8 +2198,18 @@ def main():
     elif args.bb60d:
         use_icom = False
 
+    # Command-line --24bit overrides config
+    if args.use_24bit:
+        use_24bit = True
+
+    # Command-line --gpu/--no-gpu overrides config
+    if args.gpu_on:
+        gpu_enabled = True
+    elif args.gpu_off:
+        gpu_enabled = False
+
     # Validate --24bit requires Icom
-    if args.use_24bit and not use_icom:
+    if use_24bit and not use_icom:
         print("Error: --24bit requires IC-R8600 (use --icom)")
         sys.exit(1)
 
@@ -2191,8 +2226,8 @@ def main():
         preamp_setting = False
 
     # Create radio instance
-    radio = FMRadio(initial_freq=initial_freq, use_icom=use_icom, use_24bit=args.use_24bit,
-                    preamp=preamp_setting)
+    radio = FMRadio(initial_freq=initial_freq, use_icom=use_icom, use_24bit=use_24bit,
+                    preamp=preamp_setting, gpu_enabled=gpu_enabled)
 
     # Run rich UI
     try:
