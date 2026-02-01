@@ -1110,10 +1110,6 @@ class FMRadio:
             self.rds_decoder.reset()
         self.rds_data = {}
 
-    def toggle_auto_mode(self):
-        """Toggle automatic RDS mode based on 19 kHz pilot detection."""
-        self.auto_mode_enabled = not self.auto_mode_enabled
-
     def toggle_profile(self):
         """Toggle demodulator profiling on/off."""
         if self.stereo_decoder:
