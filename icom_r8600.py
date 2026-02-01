@@ -301,6 +301,7 @@ class IcomR8600:
         self._iq_byte_buf = bytearray()  # Persistent byte buffer for parsing
         self._iq_aligned = False  # Whether stream is aligned to sample boundaries
         self._samples_since_sync = 0  # Counter for sync interval verification
+        self._sync_misses = 0  # Counter for missing sync patterns (should stay 0)
         self._iq_lock = threading.Lock()
         self._iq_thread = None
         self._running = False
@@ -618,6 +619,7 @@ class IcomR8600:
                 sync_pos = buf[idx:idx + sync_len * 3].find(sync_bytes)
                 if sync_pos == -1:
                     # No sync where expected - we're misaligned, search further
+                    self._sync_misses += 1
                     sync_pos = buf[idx:].find(sync_bytes)
                     if sync_pos != -1:
                         idx += sync_pos + sync_len
@@ -634,6 +636,7 @@ class IcomR8600:
                     continue
                 else:
                     # Sync nearby but not at position 0 - we drifted
+                    self._sync_misses += 1
                     idx += sync_pos + sync_len
                     self._samples_since_sync = 0
                     continue

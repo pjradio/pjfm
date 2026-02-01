@@ -1605,7 +1605,7 @@ def build_display(radio, width=80):
 
         table.add_row("Peak:", peak_text)
 
-        # Sample loss from BB60D
+        # Sample loss from device
         total_loss = getattr(radio.device, 'total_sample_loss', 0)
         recent_loss = getattr(radio.device, 'recent_sample_loss', 0)
         loss_text = Text()
@@ -1615,6 +1615,14 @@ def build_display(radio, width=80):
                 loss_text.append(f"  (recent: {recent_loss})", style="red")
         else:
             loss_text.append("0", style="green bold")
+
+        # Sync misses (IC-R8600 only) - append to loss line
+        sync_misses = getattr(radio.device, '_sync_misses', 0)
+        if sync_misses > 0:
+            loss_text.append(f"  sync:{sync_misses}", style="red bold")
+        elif radio.use_icom:
+            loss_text.append("  sync:0", style="green bold")
+
         table.add_row("IQ Loss:", loss_text)
 
         # RDS coherent demod diagnostics (when enabled)
