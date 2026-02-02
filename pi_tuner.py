@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-PI Loop Tuner for pyfm Resampler
+PI Loop Tuner for pjfm Resampler
 
 This script provides automated optimization of the PI controller that
 manages audio buffer level by adjusting the resample rate.
@@ -12,7 +12,7 @@ Usage:
     ./pi_tuner.py [--run | --analyze | --optimize]
 
 Modes:
-    --run       Run pyfm for 90 seconds with detailed logging
+    --run       Run pjfm for 90 seconds with detailed logging
     --analyze   Analyze the last log file and report metrics
     --optimize  Run multiple iterations to find optimal PI gains
 """
@@ -27,8 +27,8 @@ import numpy as np
 from pathlib import Path
 
 # Log file location
-LOG_FILE = "/tmp/pyfm_pi_detailed.log"
-METRICS_FILE = "/tmp/pyfm_pi_metrics.txt"
+LOG_FILE = "/tmp/pjfm_pi_detailed.log"
+METRICS_FILE = "/tmp/pjfm_pi_metrics.txt"
 
 
 def parse_log_file(log_path=LOG_FILE):
@@ -194,7 +194,7 @@ def print_metrics(metrics):
     print("=" * 60)
 
 
-def generate_plot(data, output_path="/tmp/pyfm_pi_plot.png"):
+def generate_plot(data, output_path="/tmp/pjfm_pi_plot.png"):
     """Generate a plot of the PI loop behavior."""
     try:
         import matplotlib
@@ -308,9 +308,9 @@ def generate_ascii_plot(data, width=70, height=15):
     return "\n".join(lines)
 
 
-def run_pyfm_headless(duration_s=90, frequency=89.9, kp=None, ki=None):
+def run_pjfm_headless(duration_s=90, frequency=89.9, kp=None, ki=None):
     """
-    Run pyfm in headless mode for the specified duration.
+    Run pjfm in headless mode for the specified duration.
 
     Args:
         duration_s: How long to run in seconds
@@ -333,15 +333,15 @@ def run_pyfm_headless(duration_s=90, frequency=89.9, kp=None, ki=None):
     env['PYFM_HEADLESS'] = '1'
     env['PYFM_DURATION'] = str(duration_s)
 
-    print(f"Starting pyfm on {frequency} MHz for {duration_s} seconds...")
+    print(f"Starting pjfm on {frequency} MHz for {duration_s} seconds...")
     if kp is not None:
         print(f"  Kp override: {kp}")
     if ki is not None:
         print(f"  Ki override: {ki}")
 
-    # Run pyfm
-    pyfm_path = Path(__file__).parent / "pyfm.py"
-    cmd = [sys.executable, str(pyfm_path), str(frequency)]
+    # Run pjfm
+    pjfm_path = Path(__file__).parent / "pjfm.py"
+    cmd = [sys.executable, str(pjfm_path), str(frequency)]
 
     try:
         proc = subprocess.Popen(
@@ -373,7 +373,7 @@ def run_pyfm_headless(duration_s=90, frequency=89.9, kp=None, ki=None):
         return proc.returncode in (0, -2, None)  # -2 is SIGINT
 
     except Exception as e:
-        print(f"Error running pyfm: {e}")
+        print(f"Error running pjfm: {e}")
         return False
 
 
@@ -398,7 +398,7 @@ def optimize_pi_gains(iterations=5, frequency=89.9):
         for ki in ki_values:
             print(f"\n--- Testing Kp={kp:.6f}, Ki={ki:.8f} ---")
 
-            if run_pyfm_headless(duration_s=60, frequency=frequency, kp=kp, ki=ki):
+            if run_pjfm_headless(duration_s=60, frequency=frequency, kp=kp, ki=ki):
                 data = parse_log_file()
                 metrics = compute_metrics(data)
 
@@ -413,7 +413,7 @@ def optimize_pi_gains(iterations=5, frequency=89.9):
                 else:
                     print("  Failed to compute metrics")
             else:
-                print("  pyfm run failed")
+                print("  pjfm run failed")
 
     if not results:
         print("\nNo successful runs!")
@@ -439,9 +439,9 @@ def optimize_pi_gains(iterations=5, frequency=89.9):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="PI Loop Tuner for pyfm")
+    parser = argparse.ArgumentParser(description="PI Loop Tuner for pjfm")
     parser.add_argument('--run', action='store_true',
-                        help='Run pyfm for 90 seconds with detailed logging')
+                        help='Run pjfm for 90 seconds with detailed logging')
     parser.add_argument('--analyze', action='store_true',
                         help='Analyze the last log file')
     parser.add_argument('--optimize', action='store_true',
@@ -475,7 +475,7 @@ def main():
         return
 
     if args.run:
-        success = run_pyfm_headless(
+        success = run_pjfm_headless(
             duration_s=args.duration,
             frequency=args.frequency,
             kp=args.kp,

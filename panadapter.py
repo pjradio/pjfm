@@ -352,7 +352,7 @@ class WBFMStereoDemodulator:
     ~312.5 kHz for optimal stereo decoder performance.
     """
 
-    # Target sample rate for stereo decoder (matches pyfm)
+    # Target sample rate for stereo decoder (matches pjfm)
     TARGET_RATE = 312500
 
     def __init__(self, input_sample_rate, audio_sample_rate=AUDIO_SAMPLE_RATE):

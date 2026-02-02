@@ -6,8 +6,8 @@ Tests mathematically correct mono and stereo FM decoding with high stereo separa
 Documents phase/delay relationships throughout the decode chain.
 
 Usage:
-    python test_pyfm.py          # Run all tests with detailed output
-    pytest test_pyfm.py -v       # Run with pytest (if installed)
+    python test_pjfm.py          # Run all tests with detailed output
+    pytest test_pjfm.py -v       # Run with pytest (if installed)
 
 Signal Flow:
     IQ -> FM Demod -> Pilot BPF (201 taps) -> carrier regen -> 38 kHz carrier

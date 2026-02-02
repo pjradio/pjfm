@@ -3,14 +3,14 @@
 IC-R8600 RF Diagnostics
 
 Run this to check and adjust RF settings for optimal I/Q streaming.
-Stop pyfm first before running this.
+Stop pjfm first before running this.
 """
 
 import sys
 import time
 
 # Add parent directory to path
-sys.path.insert(0, '/home/philj/dev/pyfm')
+sys.path.insert(0, '/home/philj/dev/pjfm')
 import icom_r8600 as r8600
 
 def main():

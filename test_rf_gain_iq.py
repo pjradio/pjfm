@@ -6,14 +6,14 @@ This script tests whether RF gain settings affect the I/Q output level.
 The hypothesis is that the I/Q output may be tapped from a fixed point
 in the signal chain, independent of RF gain settings.
 
-Stop pyfm before running this.
+Stop pjfm before running this.
 """
 
 import sys
 import time
 import numpy as np
 
-sys.path.insert(0, '/home/philj/dev/pyfm')
+sys.path.insert(0, '/home/philj/dev/pjfm')
 import icom_r8600 as r8600
 
 def analyze_samples(samples, label):

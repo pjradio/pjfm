@@ -1,4 +1,4 @@
-pyfm is a software-defined FM radio receiver supporting the SignalHound BB60D and Icom IC-R8600.
+pjfm is a software-defined FM radio receiver supporting the SignalHound BB60D and Icom IC-R8600.
 
 It receives broadcast FM (88-108 MHz) and NOAA Weather Radio (162 MHz), performs all demodulation
 in software, and plays audio through the default Linux audio device.
@@ -12,10 +12,10 @@ in software, and plays audio through the default Linux audio device.
 
 ```bash
 # With BB60D (default)
-./pyfm.py [frequency_mhz]
+./pjfm.py [frequency_mhz]
 
 # With IC-R8600
-./pyfm.py --icom [frequency_mhz]
+./pjfm.py --icom [frequency_mhz]
 ```
 
 ## Controls
@@ -44,14 +44,14 @@ pip install numpy scipy sounddevice rich pyusb  # pyusb for IC-R8600
 
 ### Core Components
 
-- `pyfm.py` - Main CLI application with terminal UI (Rich), audio playback, spectrum analyzer
+- `pjfm.py` - Main CLI application with terminal UI (Rich), audio playback, spectrum analyzer
 - `panadapter.py` - PyQt5 GUI with spectrum/waterfall display and FM demodulation
 - `demodulator.py` - FM stereo decoder (FMStereoDecoder) and NBFM decoder (NBFMDecoder)
 - `rds_decoder.py` - RDS/RBDS decoding (station ID, program type, radio text, clock)
 - `bb60d.py` - SignalHound BB60D I/Q streaming interface
 - `icom_r8600.py` - IC-R8600 USB I/Q interface with CI-V control
 
-### pyfm.py Architecture
+### pjfm.py Architecture
 
 Main classes:
 - **FMRadio** - Application controller, coordinates device, demodulators, audio, and UI
@@ -69,7 +69,7 @@ Key features:
 **Initialization**:
 - Automatic Cypress FX2 firmware upload when device in bootloader mode (PID 0x0022)
 - Firmware file: `IC-R8600_usb_iq.spt` (from Icom USB I/Q Package for HDSDR)
-- Search paths: script directory, `~/dev/`, `~/.local/share/pyfm/`
+- Search paths: script directory, `~/dev/`, `~/.local/share/pjfm/`
 
 **Sample Rates**: 240 kHz, 480 kHz, 960 kHz, 1.92 MHz, 3.84 MHz, 5.12 MHz
 **Bit Depth**: 16-bit (default), 24-bit (available at all rates except 5.12 MHz)

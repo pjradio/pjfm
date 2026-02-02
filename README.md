@@ -1,4 +1,4 @@
-# pyfm
+# pjfm
 
 A real-time FM broadcast receiver with software-defined stereo demodulation and RDS decoding, supporting both SignalHound BB60D and Icom IC-R8600.
 
@@ -7,7 +7,7 @@ A real-time FM broadcast receiver with software-defined stereo demodulation and 
 
 ## Overview
 
-pyfm is a command-line FM radio application that receives broadcast FM signals (88-108 MHz) and NOAA Weather Radio (162 MHz), performs all demodulation in software, and plays audio through the default Linux audio device. It features a rich terminal UI with real-time signal metrics, a 16-band spectrum analyzer, and full RDS (Radio Data System) decoding.
+pjfm is a command-line FM radio application that receives broadcast FM signals (88-108 MHz) and NOAA Weather Radio (162 MHz), performs all demodulation in software, and plays audio through the default Linux audio device. It features a rich terminal UI with real-time signal metrics, a 16-band spectrum analyzer, and full RDS (Radio Data System) decoding.
 
 ## Features
 
@@ -41,7 +41,7 @@ pyfm is a command-line FM radio application that receives broadcast FM signals (
 
 ### IQ Streaming and FM Demodulation
 
-pyfm captures raw RF samples via I/Q streaming and performs FM demodulation entirely in software:
+pjfm captures raw RF samples via I/Q streaming and performs FM demodulation entirely in software:
 
 ```
 IQ Samples (250-480 kHz) -> Quadrature Discriminator -> Baseband (0-100 kHz)
@@ -137,7 +137,7 @@ RDS data is organized into 26-bit blocks (16 data + 10 checkword), grouped into 
 
 ### Adaptive Rate Control
 
-pyfm uses a PI (proportional-integral) controller to match the I/Q sample rate to the audio card clock:
+pjfm uses a PI (proportional-integral) controller to match the I/Q sample rate to the audio card clock:
 
 - **Problem**: Clock drift between I/Q source and audio output causes buffer underruns/overruns
 - **Solution**: Monitor audio buffer level and adjust resample ratio in real-time
@@ -212,13 +212,13 @@ output = tanh(input * 1.5) / tanh(1.5)
 
 ```bash
 # With BB60D (default)
-./pyfm.py [frequency_mhz]
+./pjfm.py [frequency_mhz]
 
 # With IC-R8600
-./pyfm.py --icom [frequency_mhz]
+./pjfm.py --icom [frequency_mhz]
 
 # Show version info
-./pyfm.py --version
+./pjfm.py --version
 ```
 
 ### Controls
@@ -239,7 +239,7 @@ output = tanh(input * 1.5) / tanh(1.5)
 
 ### Configuration
 
-Settings are saved to `pyfm.cfg`:
+Settings are saved to `pjfm.cfg`:
 - Last tuned frequency (restored on startup)
 - Frequency presets
 - Tone control settings

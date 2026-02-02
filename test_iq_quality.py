@@ -10,7 +10,7 @@ import sys
 import time
 import numpy as np
 
-sys.path.insert(0, '/home/philj/dev/pyfm')
+sys.path.insert(0, '/home/philj/dev/pjfm')
 import icom_r8600 as r8600
 
 def main():

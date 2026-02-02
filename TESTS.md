@@ -2,16 +2,16 @@
 
 ## Overview
 
-`test_pyfm.py` is a comprehensive test suite for the FM stereo decoder in `demodulator.py` and GPU-accelerated demodulator in `gpu.py`. It verifies mathematically correct mono and stereo FM decoding with textbook accuracy, documents phase/delay relationships throughout the decode chain, and validates CPU/GPU implementation parity.
+`test_pjfm.py` is a comprehensive test suite for the FM stereo decoder in `demodulator.py` and GPU-accelerated demodulator in `gpu.py`. It verifies mathematically correct mono and stereo FM decoding with textbook accuracy, documents phase/delay relationships throughout the decode chain, and validates CPU/GPU implementation parity.
 
 ## Running the Tests
 
 ```bash
 # Run all tests with detailed output
-python test_pyfm.py
+python test_pjfm.py
 
 # Run with pytest (if installed)
-pytest test_pyfm.py -v
+pytest test_pjfm.py -v
 ```
 
 ## Test Results Summary

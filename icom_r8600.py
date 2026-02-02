@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-IC-R8600 I/Q Streaming Interface for pyfm
+IC-R8600 I/Q Streaming Interface for pjfm
 
 Provides a BB60D-compatible interface for the Icom IC-R8600's USB I/Q output.
 Uses the protocol discovered via USB traffic capture analysis.
@@ -130,8 +130,8 @@ def _find_firmware_file():
         os.path.join(os.path.dirname(__file__), "IC-R8600_usb_iq.spt"),
         os.path.expanduser("~/dev/IC-R8600_usb_iq.spt"),
         os.path.expanduser("~/dev/r8600start/IC-R8600_usb_iq.spt"),
-        os.path.expanduser("~/.local/share/pyfm/IC-R8600_usb_iq.spt"),
-        "/usr/share/pyfm/IC-R8600_usb_iq.spt",
+        os.path.expanduser("~/.local/share/pjfm/IC-R8600_usb_iq.spt"),
+        "/usr/share/pjfm/IC-R8600_usb_iq.spt",
     ]
     for path in search_paths:
         if os.path.exists(path):
@@ -193,7 +193,7 @@ def _switch_to_iq_mode(bootloader_dev):
     if not spt_path:
         raise RuntimeError(
             "IC-R8600 firmware file not found.\n"
-            "Please copy IC-R8600_usb_iq.spt to ~/dev/ or ~/.local/share/pyfm/\n"
+            "Please copy IC-R8600_usb_iq.spt to ~/dev/ or ~/.local/share/pjfm/\n"
             "This file is from the Icom USB I/Q Package for HDSDR."
         )
 
@@ -256,7 +256,7 @@ class IcomR8600:
     """
     IC-R8600 I/Q streaming interface compatible with BB60D API.
 
-    Provides the same methods as BB60D for use with pyfm's FMRadio class.
+    Provides the same methods as BB60D for use with pjfm's FMRadio class.
     """
 
     # Frequency limits - R8600 covers 10 kHz to 3 GHz

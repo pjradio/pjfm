@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-pyfm - FM Radio Receiver for SignalHound BB60D
+pjfm - FM Radio Receiver for SignalHound BB60D
 Copyright (c) 2026 Phil Jensen <philj@philandamy.org>
 All rights reserved.
 
@@ -12,7 +12,7 @@ A command-line FM radio application that:
 - Allows frequency tuning via arrow keys
 
 Usage:
-    ./pyfm.py [frequency_mhz]
+    ./pjfm.py [frequency_mhz]
 
 Controls:
     Left/Right arrows: Tune down/up by 100 kHz (FM) or 25 kHz (Weather)
@@ -549,7 +549,7 @@ class FMRadio:
     SIGNAL_CAL_OFFSET_DB_R8600 = -23.0  # Base offset before IQ gain compensation
 
     # Config file path (in same directory as script)
-    CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'pyfm.cfg')
+    CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'pjfm.cfg')
 
     def __init__(self, initial_freq=89.9e6, use_icom=False, use_24bit=False, preamp=None):
         """
@@ -789,7 +789,7 @@ class FMRadio:
 
         # Rate control logging (detailed log for tuning)
         self._audio_loop_start = time.perf_counter()
-        self._pi_log_path = os.environ.get('PYFM_PI_LOG', '/tmp/pyfm_pi_detailed.log')
+        self._pi_log_path = os.environ.get('PYFM_PI_LOG', '/tmp/pjfm_pi_detailed.log')
         self._pi_log_detailed = os.environ.get('PYFM_PI_LOG') is not None
 
         while self.running:
@@ -1806,11 +1806,11 @@ def build_display(radio, width=80):
     content.add_row(Align.center(presets))
 
     if radio.weather_mode:
-        panel_title = "[bold yellow]🌦️ pyfm[/] [dim]- NOAA Weather Radio[/]"
+        panel_title = "[bold yellow]🌦️ pjfm[/] [dim]- NOAA Weather Radio[/]"
         border_style = "yellow"
     else:
         device_name = "Icom IC-R8600" if radio.use_icom else "SignalHound BB60D"
-        panel_title = f"[bold cyan]📻 pyfm[/] [dim]- {device_name} FM Receiver[/]"
+        panel_title = f"[bold cyan]📻 pjfm[/] [dim]- {device_name} FM Receiver[/]"
         border_style = "cyan"
 
     panel = Panel(
@@ -1857,7 +1857,7 @@ def run_headless(radio, duration_s=90):
         print("\nInterrupted")
     finally:
         radio.stop()
-        print(f"Headless run completed. Log at: {os.environ.get('PYFM_PI_LOG', '/tmp/pyfm_pi_detailed.log')}")
+        print(f"Headless run completed. Log at: {os.environ.get('PYFM_PI_LOG', '/tmp/pjfm_pi_detailed.log')}")
 
 
 def run_rich_ui(radio):
@@ -2012,7 +2012,7 @@ def run_rich_ui(radio):
 def main():
     """Main entry point."""
     parser = argparse.ArgumentParser(
-        description="pyfm - FM Radio Receiver for SignalHound BB60D or Icom IC-R8600"
+        description="pjfm - FM Radio Receiver for SignalHound BB60D or Icom IC-R8600"
     )
     parser.add_argument(
         "frequency",
@@ -2062,7 +2062,7 @@ def main():
         sys.exit(1)
 
     if args.version:
-        print("pyfm - FM Radio Receiver")
+        print("pjfm - FM Radio Receiver")
         if bb60d_get_api_version:
             try:
                 print(f"BB60D API Version: {bb60d_get_api_version()}")
@@ -2095,7 +2095,7 @@ def main():
     initial_freq = 89.9e6  # Default frequency
     use_icom = False  # Default device
     use_24bit = False  # Default 16-bit I/Q
-    config_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'pyfm.cfg')
+    config_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'pjfm.cfg')
     if os.path.exists(config_path):
         config = configparser.ConfigParser()
         try:
