@@ -1,0 +1,262 @@
+IC-R8600 I/Q Capture Implementation Analysis
+=============================================
+Date: 2026-02-02
+File: icom_r8600.py
+
+This document summarizes the analysis of the IC-R8600 I/Q streaming
+implementation, issues found, fixes applied, and remaining work.
+
+================================================================================
+SUMMARY
+================================================================================
+
+The IC-R8600 I/Q capture implementation is sophisticated and generally solid.
+Hardware testing confirmed:
+- 60 seconds continuous streaming with 0 sync misses
+- 28.8 million samples processed without loss
+- Sync patterns are perfectly regular (all intervals identical)
+
+Three bugs were fixed. Several design improvements remain for future work.
+
+================================================================================
+ISSUES FIXED (Commit a6b1700)
+================================================================================
+
+1. BYTES_NEEDED CALCULATION BUG
+   Location: icom_r8600.py line 592 (originally 579)
+
+   Problem:
+     Old code used hardcoded heuristic: num_samples // 1024
+     This underestimated buffer needs at 240 kHz (sync interval = 512)
+
+   Fix:
+     sync_interval = SYNC_INTERVAL.get(self.iq_sample_rate, 1024)
+     syncs_expected = num_samples // sync_interval + 2
+     bytes_needed = num_samples * sample_size + len(sync_bytes) * syncs_expected
+
+2. UNBOUNDED BUFFER GROWTH
+   Location: icom_r8600.py _iq_reader_loop()
+
+   Problem:
+     If fetch_iq() was called slower than USB read rate, _iq_buffer
+     would grow indefinitely, eventually exhausting memory.
+
+   Fix:
+     Added MAX_IQ_BUFFER_BYTES = 5 MB limit
+     When exceeded, oldest chunks are dropped and _buffer_overflow_count incremented
+     Buffer trimmed to 50% of limit to provide headroom
+
+3. NO DIAGNOSTICS API
+   Location: icom_r8600.py (new method)
+
+   Problem:
+     Diagnostic counters existed but weren't exposed to applications.
+     Required manual inspection of private attributes.
+
+   Fix:
+     Added get_diagnostics() method returning dict with all counters:
+     - sync_misses, sync_invalid_24, buffer_overflow_count
+     - total_sample_loss, recent_sample_loss
+     - fetch_last_ms, fetch_slow_count
+     - civ_timeouts, initial_aligns, flush_during_fetch
+
+================================================================================
+ISSUES DOCUMENTED (Not Fixed)
+================================================================================
+
+4. DC OFFSET SETTLING TIME
+   Location: icom_r8600.py lines 296-297, 753-756
+
+   Current behavior:
+     EMA with alpha=0.001 takes ~1000 blocks (~17 seconds) to converge
+     DC offset starts at 0, causing initial reception quality impact
+
+   Recommendation:
+     Use adaptive alpha: start with 0.1 for first 10 blocks,
+     then decay to 0.001 for steady-state tracking.
+
+     Example:
+       if self._block_count < 10:
+           alpha = 0.1
+       else:
+           alpha = 0.001
+       self._dc_offset = alpha * block_dc + (1 - alpha) * self._dc_offset
+
+================================================================================
+ISSUES NOT ADDRESSED (Future Work)
+================================================================================
+
+5. USB THREAD SILENT FAILURE
+   Location: icom_r8600.py lines 543-547
+
+   Problem:
+     On USBError (not timeout), the reader thread breaks permanently.
+     No automatic restart, no callback to notify application.
+     Application must manually detect and reopen device.
+
+   Current code:
+     except usb.core.USBError:
+         if self._running:
+             self.recent_sample_loss += 1
+             self.total_sample_loss += 1
+         break  # Thread dies here
+
+   Recommendation:
+     - Add _usb_error_count counter
+     - Log the error details
+     - Attempt automatic recovery (reopen endpoint)
+     - Add optional error callback for application notification
+     - Consider exponential backoff retry
+
+6. SYNC SEARCH WINDOW TOO SMALL
+   Location: icom_r8600.py line 682
+
+   Problem:
+     When sync is missed, only searches next 3 sync intervals:
+       sync_pos = buf[idx:idx + sync_len * 3].find(sync_bytes)
+
+     If USB latency causes larger glitch (>3 sync intervals),
+     sync may not be found in narrow window.
+
+   Recommendation:
+     - Increase search window to 10 sync intervals
+     - Add adaptive search: start narrow, widen on repeated misses
+     - Track consecutive misses and trigger full resync if threshold exceeded
+
+7. FIXED USB READ SIZE
+   Location: icom_r8600.py line 537
+
+   Problem:
+     USB read size is fixed at 65536 bytes regardless of sample rate.
+     At 5.12 MSPS: 65536 bytes = only 3.2ms of data (tight timing)
+     At 240 kSPS: 65536 bytes = 68ms of data (unnecessary latency)
+
+   Recommendation:
+     Make read size adaptive based on sample rate:
+       target_latency_ms = 30
+       bytes_per_ms = sample_rate * bytes_per_sample / 1000
+       read_size = int(target_latency_ms * bytes_per_ms)
+       read_size = max(16384, min(read_size, 131072))  # Clamp to reasonable range
+
+8. NO REAL-TIME SCHEDULER FALLBACK WARNING
+   Location: icom_r8600.py lines 530-532
+
+   Problem:
+     If SCHED_FIFO fails (no CAP_SYS_NICE), silently falls back
+     to normal scheduling with no indication to user.
+
+   Current code:
+     except (PermissionError, OSError):
+         pass  # Silently fall back to normal scheduling
+
+   Recommendation:
+     - Log a warning when RT scheduling unavailable
+     - Add flag to indicate RT status: self._using_rt_scheduler = False
+     - Expose in get_diagnostics()
+
+9. RACE CONDITION: FLUSH DURING FETCH
+   Location: icom_r8600.py lines 800-812
+
+   Problem:
+     flush_iq() can be called while fetch_iq() is active.
+     Counter _flush_during_fetch tracks this but no protection exists.
+     Could cause data corruption or unexpected behavior.
+
+   Current mitigation:
+     _fetch_active flag set during fetch_iq()
+     _flush_during_fetch counter incremented if flush called during fetch
+
+   Recommendation:
+     - Add mutex or wait for fetch completion before flushing
+     - Or document that flush during fetch is undefined behavior
+
+10. HARDCODED TIMEOUTS
+    Locations:
+      - USB read timeout: 1000ms (line 537)
+      - Alignment timeout: 1.0s (line 595)
+      - CI-V command timeout: 2000ms (lines 416, 432)
+
+    Recommendation:
+      Make configurable via constructor or class constants:
+        USB_READ_TIMEOUT_MS = 1000
+        ALIGNMENT_TIMEOUT_S = 1.0
+        CIV_COMMAND_TIMEOUT_MS = 2000
+
+================================================================================
+TEST COVERAGE
+================================================================================
+
+New test file: test_iq_robustness.py
+
+Simulation tests (no hardware required):
+  - bytes_needed calculation correctness for all sample rates
+  - 16-bit sync pattern parsing
+  - 24-bit sync pattern parsing
+  - Sync recovery after missing/corrupted patterns
+  - DC offset EMA convergence analysis
+  - Buffer growth with overflow protection
+
+Hardware tests (requires IC-R8600):
+  - Sync pattern verification at multiple sample rates
+  - Long duration streaming (60 seconds)
+  - Diagnostics API verification
+
+Existing test: test_iq_sync.py
+  - Raw sync pattern interval analysis
+  - Confirms all intervals are exactly as expected (zero variance)
+
+================================================================================
+HARDWARE TEST RESULTS
+================================================================================
+
+test_iq_robustness.py (60-second long duration test):
+  - Total fetches: 3,515
+  - Total samples: 28,794,880
+  - Sync misses: 0
+  - Sample loss events: 0
+  - Max fetch time: 41.2 ms
+  - Buffer overflows: 0
+
+test_iq_sync.py (10-second raw analysis, 24-bit 480 kHz):
+  - Sync patterns found: 4,699
+  - Unique intervals: 1 (all identical)
+  - Interval: 1024 samples (6150 bytes)
+  - Verdict: All sync patterns at exactly expected positions
+
+================================================================================
+ARCHITECTURE NOTES
+================================================================================
+
+Sync Pattern Detection:
+  16-bit: 0x8000, 0x8000 (4 bytes: 00 80 00 80)
+  24-bit: 0x8000, 0x8001, 0x8002 (6 bytes: 00 80 01 80 02 80)
+
+Sync Intervals (samples between markers):
+  5.12 MSPS: 10923 samples (16-bit only)
+  3.84 MSPS: 8192 samples
+  1.92 MSPS: 4096 samples
+  960 kSPS:  2048 samples
+  480 kSPS:  1024 samples
+  240 kSPS:  512 samples
+
+Data Flow:
+  1. _iq_reader_loop thread reads 64KB USB chunks into _iq_buffer list
+  2. fetch_iq() transfers chunks to _iq_byte_buf bytearray
+  3. Byte-level parsing extracts samples, skipping sync patterns
+  4. DC offset removed via EMA tracking
+  5. Samples normalized and returned as complex64 numpy array
+
+Buffer Management:
+  - _iq_buffer: List of raw USB chunks (now bounded to 5MB)
+  - _iq_byte_buf: Persistent bytearray for parsing across fetch calls
+  - Handles sync patterns that straddle USB read boundaries
+
+================================================================================
+REFERENCES
+================================================================================
+
+- Icom I/Q Reference Guide (for sync pattern and sample format specs)
+- IC-R8600_usb_iq.spt firmware file (Cypress FX2 firmware for USB I/Q)
+- CLAUDE.md project documentation
+
+================================================================================
