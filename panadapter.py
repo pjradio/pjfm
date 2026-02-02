@@ -692,7 +692,7 @@ class SpectrumWidget(pg.PlotWidget):
         self.setLabel('bottom', 'Frequency', units='MHz')
         self.setTitle('Spectrum')
         self.showGrid(x=True, y=True, alpha=0.3)
-        self.setYRange(-150, -70)
+        self.setYRange(-120, -75)
         # Fixed width for axes to align with waterfall
         self.getAxis('left').setWidth(80)
         self.getAxis('right').setWidth(0)
@@ -1343,7 +1343,7 @@ class MainWindow(QMainWindow):
             self.snr_label.hide()
             self.snr_indicator.hide()
             # Set spectrum range for weather radio
-            self.spectrum_widget.set_db_range(-150, -70)
+            self.spectrum_widget.set_db_range(-120, -75)
 
         # Update frequency step buttons
         self.update_freq_button_labels()
@@ -1648,20 +1648,13 @@ class MainWindow(QMainWindow):
 
         self.current_mode = new_mode
 
-        # Pause data thread during reconfiguration
+        # Pause data thread during frequency change
         if self.data_thread:
             self.data_thread.pause()
 
-        # Get new frequency and sample rate for this mode
+        # Get new frequency for this mode (keep same sample rate to avoid thread issues)
         if new_mode == self.MODE_FM_BROADCAST:
             new_freq = FM_BROADCAST_DEFAULT
-            # Use IC-R8600-specific default if no rate requested
-            if self.requested_sample_rate:
-                new_sample_rate = self.requested_sample_rate
-            elif self.use_icom:
-                new_sample_rate = ICOM_SAMPLE_RATE_FM  # 960 kHz
-            else:
-                new_sample_rate = FM_BROADCAST_SAMPLE_RATE
             # Hide NOAA presets and hum filter (not applicable to FM broadcast)
             self.noaa_label.hide()
             for btn in self.noaa_buttons:
@@ -1669,52 +1662,20 @@ class MainWindow(QMainWindow):
             self.hum_filter_checkbox.hide()
         else:
             new_freq = DEFAULT_CENTER_FREQ
-            # Use IC-R8600-specific default if no rate requested
-            if self.requested_sample_rate:
-                new_sample_rate = self.requested_sample_rate
-            elif self.use_icom:
-                new_sample_rate = ICOM_SAMPLE_RATE_WEATHER  # 480 kHz
-            else:
-                new_sample_rate = SAMPLE_RATE
             # Show NOAA presets and hum filter
             self.noaa_label.show()
             for btn in self.noaa_buttons:
                 btn.show()
             self.hum_filter_checkbox.show()
 
-        # For IC-R8600 with user-specified rate, find nearest available
-        if self.use_icom and self.requested_sample_rate:
-            available_rates = sorted(self.ICOM_SAMPLE_RATES)
-            chosen_rate = available_rates[0]
-            for rate in available_rates:
-                if rate >= new_sample_rate:
-                    chosen_rate = rate
-                    break
-            else:
-                chosen_rate = available_rates[-1]
-            new_sample_rate = chosen_rate
-
-        # Reconfigure device with new sample rate and frequency
+        # Just change frequency - don't reconfigure stream (avoids spawning new threads)
         if self.device and self.device.streaming_mode:
-            self.device.configure_iq_streaming(new_freq, new_sample_rate)
-            self.bandwidth = self.device.iq_sample_rate
+            self.device.set_frequency(new_freq)
             self.center_freq = new_freq
 
-        # Update spectrum and waterfall with new bandwidth
-        self.spectrum_widget.set_bandwidth(self.bandwidth)
+        # Update spectrum and waterfall with new center frequency
         self.spectrum_widget.set_center_freq(new_freq)
-        self.waterfall_widget.set_bandwidth(self.bandwidth)
         self.waterfall_widget.set_center_freq(new_freq)
-
-        # Reset view to show full bandwidth
-        freq_start = (new_freq - self.bandwidth / 2) / 1e6
-        freq_end = (new_freq + self.bandwidth / 2) / 1e6
-        self.spectrum_widget.setXRange(freq_start, freq_end, padding=0)
-        self.waterfall_widget.plot.setXRange(freq_start, freq_end, padding=0)
-
-        # Recreate demodulators with new sample rate
-        self.nbfm_demodulator = NBFMDemodulator(self.bandwidth)
-        self.wbfm_demodulator = WBFMStereoDemodulator(self.bandwidth)
 
         # Select the appropriate demodulator and audio channels
         if new_mode == self.MODE_FM_BROADCAST:
@@ -1742,7 +1703,7 @@ class MainWindow(QMainWindow):
             self.snr_label.hide()
             self.snr_indicator.hide()
             # Restore spectrum range for weaker weather radio signals
-            self.spectrum_widget.set_db_range(-150, -70)
+            self.spectrum_widget.set_db_range(-120, -75)
 
         # Update tuned frequency to match center
         self.tuned_freq = new_freq
