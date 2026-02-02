@@ -2,7 +2,7 @@
 
 ## Overview
 
-`test_pjfm.py` is a comprehensive test suite for the FM stereo decoder in `demodulator.py` and GPU-accelerated demodulator in `gpu.py`. It verifies mathematically correct mono and stereo FM decoding with textbook accuracy, documents phase/delay relationships throughout the decode chain, and validates CPU/GPU implementation parity.
+`test_pjfm.py` is a comprehensive test suite for the FM stereo decoder in `demodulator.py`. It verifies mathematically correct mono and stereo FM decoding with textbook accuracy and documents phase/delay relationships throughout the decode chain.
 
 ## Running the Tests
 
@@ -16,13 +16,11 @@ pytest test_pjfm.py -v
 
 ## Test Results Summary
 
-**12/12 tests pass** (as of 2025-01-31)
+**10/10 tests pass** (as of 2026-02-02)
 
 | Test | Result | Notes |
 |------|--------|-------|
 | FM Demodulation Accuracy | PASS | Correlation 1.000000, 0% amplitude error |
-| GPU Demodulation Accuracy | PASS | Correlation 1.000000, 0% amplitude error |
-| CPU/GPU Parity | PASS | Correlation 1.000000, zero difference |
 | Audio SNR (Clean) | PASS | 35.3 dB (target: >35 dB) |
 | THD+N | PASS | -35.3 dB / 1.72% (target: <-35 dB) |
 | Mono Decoding | PASS | L/R correlation 1.000000 |
@@ -38,8 +36,6 @@ pytest test_pjfm.py -v
 | Metric | Target | Achieved |
 |--------|--------|----------|
 | FM demod correlation | > 0.999 | 1.000000 |
-| GPU demod correlation | > 0.999 | 1.000000 |
-| CPU/GPU parity | > 0.9999 | 1.000000 |
 | Audio SNR (clean) | > 35 dB | 35.3 dB |
 | THD+N | < -35 dB | -35.3 dB (1.72%) |
 | Stereo separation | > 30 dB | 67-100 dB |
@@ -66,24 +62,16 @@ phase = 2*pi*75000 * cumsum(multiplex) * dt
 iq = cos(phase) + j*sin(phase)
 ```
 
-### Demodulation Methods Tested
+### Demodulation Method
 
-**CPU Quadrature Discriminator** (`FMStereoDecoder`):
+**Quadrature Discriminator** (`FMStereoDecoder`):
 ```python
 # Instantaneous frequency from phase difference
 product = samples[n] * conj(samples[n-1])
 baseband = angle(product) * (sample_rate / (2*pi*deviation))
 ```
 
-**GPU Arctangent-Differentiate** (`GPUFMDemodulator`):
-```python
-# Equivalent method optimized for GPU parallelism
-phase = atan2(Q, I)
-delta_phase = unwrap(diff(phase))
-baseband = delta_phase * (sample_rate / (2*pi*deviation))
-```
-
-Both methods are mathematically equivalent and produce identical results (correlation = 1.0).
+This is the standard FM demodulation technique that extracts instantaneous frequency from the phase difference between consecutive samples.
 
 ### Measurement Techniques
 
@@ -112,9 +100,7 @@ Both methods are mathematically equivalent and produce identical results (correl
 IQ samples (250 kHz)
     |
     v
-FM Demodulation
-    |--- CPU: quadrature discriminator (angle of product)
-    |--- GPU: arctangent-differentiate (atan2 + unwrap)
+FM Demodulation (quadrature discriminator)
     |
     +---> Pilot BPF (201 taps, 18.5-19.5 kHz)
     |         |
@@ -164,20 +150,6 @@ Verifies the CPU quadrature discriminator correctly recovers FM baseband.
 - Compares demodulated output to original input
 - **Target**: Correlation > 0.999, amplitude error < 1%
 - **Result**: Correlation 1.000000, 0% error
-
-### test_gpu_demod_accuracy
-Verifies the GPU arctangent-differentiate method matches expected output.
-- Same methodology as CPU test
-- Tests ROCm/CUDA backend or CPU fallback
-- **Target**: Correlation > 0.999, amplitude error < 1%
-- **Result**: Correlation 1.000000, 0% error
-
-### test_cpu_gpu_parity
-Verifies CPU and GPU implementations produce identical results.
-- Demodulates same IQ data through both paths
-- Compares baseband outputs sample-by-sample
-- **Target**: Correlation > 0.9999
-- **Result**: Correlation 1.000000, zero difference
 
 ### test_audio_snr
 Measures signal-to-noise ratio of decoded audio with clean synthetic input.
@@ -274,24 +246,6 @@ Tests decoder behavior with AWGN-corrupted input.
 | 10 dB | 30.1 dB | Yes | 0.02 |
 
 **Result**: Decoder maintains >30 dB output SNR even with 10 dB input
-
-## GPU Acceleration
-
-The test suite validates GPU-accelerated FM demodulation via `gpu.py`:
-
-### GPUFMDemodulator
-- Uses PyTorch for ROCm (AMD) or CUDA (NVIDIA) acceleration
-- Arctangent-differentiate algorithm parallelizes well on GPU
-- Falls back to CPU NumPy implementation if GPU unavailable
-- Produces bit-identical results to CPU path
-
-### Test Environment
-```
-GPU: AMD Radeon RX 7600
-Backend: ROCm/HIP via PyTorch
-CPU/GPU correlation: 1.000000
-Max absolute difference: 0.000000
-```
 
 ## Implementation Notes
 

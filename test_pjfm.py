@@ -44,7 +44,6 @@ Validation Targets:
     Stereo separation: > 30 dB (67+ dB typical with synthetic signal)
     L/R timing: < 5 samples at 48 kHz
     Frequency response: +/- 3 dB below 1 kHz
-    CPU/GPU demod parity: Correlation > 0.9999
 """
 
 import numpy as np
@@ -52,7 +51,6 @@ from scipy import signal
 import sys
 
 from demodulator import FMStereoDecoder
-from gpu import GPUFMDemodulator
 
 
 # =============================================================================
@@ -412,131 +410,6 @@ def test_fm_demod_accuracy():
     passed = correlation > 0.999 and amplitude_error < 1.0
     print(f"  Result: {'PASS' if passed else 'FAIL'}")
 
-    return passed
-
-
-def test_gpu_demod_accuracy():
-    """
-    Test GPU FM demodulation accuracy.
-
-    Uses GPUFMDemodulator to demodulate FM signal and compares to expected.
-    If GPU is not available, test passes with a skip message.
-
-    Pass criteria: Correlation > 0.999, amplitude error < 1%
-    """
-    print("\n" + "=" * 60)
-    print("TEST: GPU FM Demodulation Accuracy")
-    print("=" * 60)
-
-    sample_rate = 250000
-    duration = 0.1  # 100 ms
-    test_freq = 1000  # 1 kHz test tone
-
-    # Generate test tone baseband
-    baseband_in = generate_test_tone(test_freq, duration, sample_rate, amplitude=0.5)
-
-    # FM modulate to I/Q
-    iq = fm_modulate(baseband_in, sample_rate, deviation=75000)
-
-    # Create GPU demodulator
-    gpu_demod = GPUFMDemodulator(sample_rate=sample_rate, deviation=75000)
-
-    if gpu_demod.backend == 'cpu':
-        print("  GPU not available - testing CPU fallback path")
-
-    # Demodulate
-    baseband_out = gpu_demod.demodulate(iq)
-
-    # Allow for settling - skip first and last samples
-    skip = 2000
-    baseband_in_trimmed = baseband_in[skip:-skip]
-    baseband_out_trimmed = baseband_out[skip:-skip]
-
-    # Compute correlation
-    correlation = np.corrcoef(baseband_in_trimmed, baseband_out_trimmed)[0, 1]
-
-    # Compute RMS amplitude ratio
-    rms_in = np.sqrt(np.mean(baseband_in_trimmed ** 2))
-    rms_out = np.sqrt(np.mean(baseband_out_trimmed ** 2))
-    amplitude_ratio = rms_out / rms_in
-    amplitude_error = abs(1.0 - amplitude_ratio) * 100
-
-    print(f"  Backend: {gpu_demod.backend}")
-    print(f"  Correlation: {correlation:.6f}")
-    print(f"  Amplitude ratio: {amplitude_ratio:.4f}")
-    print(f"  Amplitude error: {amplitude_error:.2f}%")
-
-    passed = correlation > 0.999 and amplitude_error < 1.0
-    print(f"  Result: {'PASS' if passed else 'FAIL'}")
-
-    gpu_demod.cleanup()
-    return passed
-
-
-def test_cpu_gpu_parity():
-    """
-    Test CPU and GPU demodulation produce matching results.
-
-    Compares FMStereoDecoder CPU path with GPUFMDemodulator output.
-    Both should produce effectively identical baseband signals.
-
-    Pass criteria: Correlation > 0.9999 between CPU and GPU output
-    """
-    print("\n" + "=" * 60)
-    print("TEST: CPU/GPU Demodulation Parity")
-    print("=" * 60)
-
-    sample_rate = 250000
-    duration = 0.1  # 100 ms
-    test_freq = 1000  # 1 kHz test tone
-
-    # Generate FM signal
-    baseband_in = generate_test_tone(test_freq, duration, sample_rate, amplitude=0.5)
-    iq = fm_modulate(baseband_in, sample_rate, deviation=75000)
-
-    # CPU demodulation via FMStereoDecoder
-    decoder = FMStereoDecoder(
-        iq_sample_rate=sample_rate,
-        audio_sample_rate=sample_rate,  # No resampling
-        deviation=75000,
-        deemphasis=1e-9
-    )
-    decoder.bass_boost_enabled = False
-    decoder.treble_boost_enabled = False
-    decoder.stereo_blend_enabled = False
-    _ = decoder.demodulate(iq)
-    cpu_baseband = decoder.last_baseband
-
-    # GPU demodulation
-    gpu_demod = GPUFMDemodulator(sample_rate=sample_rate, deviation=75000)
-    gpu_baseband = gpu_demod.demodulate(iq)
-
-    print(f"  GPU backend: {gpu_demod.backend}")
-
-    # Compare outputs (skip settling region)
-    skip = 2000
-    cpu_trimmed = cpu_baseband[skip:-skip]
-    gpu_trimmed = gpu_baseband[skip:-skip]
-
-    # Compute correlation
-    correlation = np.corrcoef(cpu_trimmed, gpu_trimmed)[0, 1]
-
-    # Compute max absolute difference
-    max_diff = np.max(np.abs(cpu_trimmed - gpu_trimmed))
-    mean_diff = np.mean(np.abs(cpu_trimmed - gpu_trimmed))
-
-    print(f"  Correlation: {correlation:.6f}")
-    print(f"  Max absolute difference: {max_diff:.6f}")
-    print(f"  Mean absolute difference: {mean_diff:.6f}")
-
-    # Both methods should produce nearly identical results
-    # The CPU uses quadrature discriminator (angle of product)
-    # The GPU uses arctangent-differentiate (atan2 + unwrap)
-    # Both are mathematically equivalent
-    passed = correlation > 0.9999
-    print(f"  Result: {'PASS' if passed else 'FAIL'} (target: correlation > 0.9999)")
-
-    gpu_demod.cleanup()
     return passed
 
 
@@ -1150,13 +1023,11 @@ def run_all_tests():
     print("\n" + "=" * 60)
     print("FM STEREO DECODER TEST SUITE")
     print("=" * 60)
-    print("\nTesting demodulator.py (FMStereoDecoder) and gpu.py (GPUFMDemodulator)")
+    print("\nTesting demodulator.py (FMStereoDecoder)")
     print("Signal flow: IQ -> FM Demod -> Pilot/L+R/L-R -> Matrix -> Audio")
 
     tests = [
         ("FM Demodulation Accuracy", test_fm_demod_accuracy),
-        ("GPU Demodulation Accuracy", test_gpu_demod_accuracy),
-        ("CPU/GPU Parity", test_cpu_gpu_parity),
         ("Audio SNR (Clean)", test_audio_snr),
         ("THD+N", test_thd_n),
         ("Mono Decoding", test_mono_decode),
@@ -1196,29 +1067,10 @@ def run_all_tests():
     print()
     print("NOTES:")
     print("  - Pilot-squaring requires TX to use -cos(2wt) subcarrier")
-    print("  - GPU tests require PyTorch with ROCm/CUDA (skipped if unavailable)")
 
     return passed_count == total_count
 
 
-def cleanup_gpu_and_exit(exit_code):
-    """Cleanup GPU resources and exit cleanly to prevent ROCm/PyTorch shutdown issues."""
-    import os
-    # Flush output buffers before any exit
-    sys.stdout.flush()
-    sys.stderr.flush()
-    try:
-        import torch
-        if torch.cuda.is_available():
-            torch.cuda.synchronize()
-            torch.cuda.empty_cache()
-            # Force immediate exit to avoid PyTorch/ROCm double-free during cleanup
-            os._exit(exit_code)
-    except ImportError:
-        pass
-    sys.exit(exit_code)
-
-
 if __name__ == "__main__":
     success = run_all_tests()
-    cleanup_gpu_and_exit(0 if success else 1)
+    sys.exit(0 if success else 1)
