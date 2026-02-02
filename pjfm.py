@@ -613,7 +613,6 @@ class FMRadio:
         self.audio_thread = None
         self.error_message = None
         self.signal_dbm = -140.0
-        self.signal_lock = threading.Lock()
         self.tuning_lock = threading.Lock()
         self.is_tuning = False
 
