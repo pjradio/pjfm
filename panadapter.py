@@ -32,7 +32,7 @@ from PyQt5.QtWidgets import (
     QCheckBox, QSizePolicy, QRadioButton, QButtonGroup
 )
 from PyQt5.QtCore import Qt, QThread, pyqtSignal, QTimer
-from PyQt5.QtGui import QFont, QDoubleValidator
+from PyQt5.QtGui import QDoubleValidator
 
 import pyqtgraph as pg
 from pyqtgraph import ColorMap
@@ -58,18 +58,14 @@ ICOM_SAMPLE_RATE_WEATHER = 480000    # 480 kHz for NBFM (plenty for 12.5 kHz cha
 ICOM_SAMPLE_RATE_FM = 960000         # 960 kHz for WBFM (good for stereo decoding)
 FFT_SIZE = 4096
 WATERFALL_HISTORY = 300  # Number of rows in waterfall
-UPDATE_RATE_MS = 50  # ~20 fps
 
 # NBFM settings (Weather Radio)
-NBFM_CHANNEL_BW = 12500  # 12.5 kHz channel bandwidth
 NBFM_DEVIATION = 5000    # ±5 kHz deviation
 AUDIO_SAMPLE_RATE = 48000  # Output audio sample rate
 
 # WBFM settings (FM Broadcast)
 WBFM_DEVIATION = 75000   # ±75 kHz deviation
 WBFM_DEEMPHASIS = 75e-6  # 75µs de-emphasis (US standard)
-FM_BROADCAST_MIN = 88.0e6   # FM broadcast band start
-FM_BROADCAST_MAX = 108.0e6  # FM broadcast band end
 FM_BROADCAST_STEP = 100e3   # 100 kHz step for FM broadcast
 FM_BROADCAST_DEFAULT = 89.9e6  # Default FM broadcast frequency
 FM_BROADCAST_SAMPLE_RATE = 1250000  # 1.25 MHz for wider spectrum view (decimated for audio)
@@ -326,160 +322,11 @@ class NBFMDemodulator:
         self.audio_buffer.clear()
 
 
-class WBFMDemodulator:
-    """Wideband FM demodulator for FM broadcast (88-108 MHz) with mono output."""
-
-    def __init__(self, input_sample_rate, audio_sample_rate=AUDIO_SAMPLE_RATE):
-        self.input_sample_rate = input_sample_rate
-        self.audio_sample_rate = audio_sample_rate
-        self.tuned_offset = 0  # Offset from center freq in Hz
-        self.squelch_level = -100  # dB threshold
-        self.squelch_open = False
-
-        # For WBFM we need high IF rate to handle ±75 kHz deviation
-        # Minimum IF rate = 2 * 75 kHz = 150 kHz, use 250 kHz for margin
-        self.if_sample_rate = 250000
-        self.decimation = max(1, int(input_sample_rate / self.if_sample_rate))
-        self.actual_if_rate = input_sample_rate / self.decimation
-
-        # Design channel filter (lowpass at input rate before decimation)
-        # WBFM needs ~200 kHz channel bandwidth to capture full signal
-        channel_cutoff = 120000 / (input_sample_rate / 2)
-        channel_cutoff = min(channel_cutoff, 0.95)  # Stay below Nyquist
-        self.channel_filter_b, self.channel_filter_a = signal.butter(
-            5, channel_cutoff, btype='low'
-        )
-        self.channel_filter_state = None
-
-        # Design audio lowpass filter (15 kHz for mono FM broadcast)
-        audio_cutoff = 15000 / (self.actual_if_rate / 2)
-        audio_cutoff = min(audio_cutoff, 0.95)  # Stay below Nyquist
-        self.audio_filter_b, self.audio_filter_a = signal.butter(
-            4, audio_cutoff, btype='low'
-        )
-        self.audio_filter_state = None
-
-        # De-emphasis filter: 75µs for US FM broadcast
-        # Use matched-pole first-order IIR for accurate time constant
-        # Applied at IF rate before final resampling
-        fs = self.actual_if_rate
-        a = np.exp(-1.0 / (WBFM_DEEMPHASIS * fs))
-        self.deem_b = np.array([1.0 - a])
-        self.deem_a = np.array([1.0, -a])
-        self.deem_state = signal.lfilter_zi(self.deem_b, self.deem_a)
-
-        # Resampler for audio output
-        self.resample_ratio = audio_sample_rate / self.actual_if_rate
-
-        # State for FM demodulation
-        self.prev_sample = 1 + 0j
-
-        # Audio output buffer
-        self.audio_buffer = deque(maxlen=int(audio_sample_rate * 0.5))  # 500ms buffer
-
-    def set_tuned_offset(self, offset_hz):
-        """Set the tuning offset from center frequency."""
-        self.tuned_offset = offset_hz
-
-    def set_squelch(self, level_db):
-        """Set squelch threshold in dB."""
-        self.squelch_level = level_db
-
-    def process(self, iq_data):
-        """
-        Process IQ samples and return demodulated audio.
-
-        Args:
-            iq_data: Complex IQ samples at input_sample_rate
-
-        Returns:
-            Audio samples at audio_sample_rate, or None if squelched
-        """
-        if len(iq_data) == 0:
-            return None
-
-        # Frequency shift to center the desired channel
-        if self.tuned_offset != 0:
-            t = np.arange(len(iq_data)) / self.input_sample_rate
-            shift = np.exp(-2j * np.pi * self.tuned_offset * t)
-            iq_data = iq_data * shift
-
-        # Apply channel filter
-        if self.channel_filter_state is None:
-            self.channel_filter_state = signal.lfilter_zi(
-                self.channel_filter_b, self.channel_filter_a
-            ) * iq_data[0]
-
-        filtered, self.channel_filter_state = signal.lfilter(
-            self.channel_filter_b, self.channel_filter_a,
-            iq_data, zi=self.channel_filter_state
-        )
-
-        # Decimate to IF rate
-        decimated = filtered[::self.decimation]
-
-        # Check signal level for squelch
-        signal_power = np.mean(np.abs(decimated) ** 2)
-        signal_db = 10 * np.log10(signal_power + 1e-20)
-
-        if signal_db < self.squelch_level:
-            self.squelch_open = False
-            return None
-
-        self.squelch_open = True
-
-        # FM demodulation using quadrature method
-        delayed = np.concatenate([[self.prev_sample], decimated[:-1]])
-        self.prev_sample = decimated[-1]
-
-        # Phase difference
-        phase_diff = np.angle(decimated * np.conj(delayed))
-
-        # Scale to audio (deviation determines gain)
-        # For ±75kHz deviation: max_phase = 2*pi*75000/actual_if_rate
-        audio = phase_diff * (self.actual_if_rate / (2 * np.pi * WBFM_DEVIATION))
-
-        # Apply audio lowpass filter (15 kHz)
-        if self.audio_filter_state is None:
-            self.audio_filter_state = signal.lfilter_zi(
-                self.audio_filter_b, self.audio_filter_a
-            ) * audio[0]
-
-        audio_filtered, self.audio_filter_state = signal.lfilter(
-            self.audio_filter_b, self.audio_filter_a,
-            audio, zi=self.audio_filter_state
-        )
-
-        # Apply 75µs de-emphasis
-        audio_deemph, self.deem_state = signal.lfilter(
-            self.deem_b, self.deem_a,
-            audio_filtered, zi=self.deem_state
-        )
-
-        # Resample to output audio rate
-        num_output_samples = int(len(audio_deemph) * self.resample_ratio)
-        if num_output_samples > 0:
-            audio_resampled = signal.resample(audio_deemph, num_output_samples)
-            # Normalize audio level
-            audio_resampled = np.clip(audio_resampled * 0.5, -1.0, 1.0)
-            return audio_resampled.astype(np.float32)
-
-        return None
-
-    def reset(self):
-        """Reset demodulator state (call when changing frequency)."""
-        self.channel_filter_state = None
-        self.audio_filter_state = None
-        self.prev_sample = 1 + 0j
-        self.deem_state = signal.lfilter_zi(self.deem_b, self.deem_a)
-        self.audio_buffer.clear()
-
-
 class WBFMStereoDemodulator:
-    """Wideband FM stereo demodulator wrapper.
+    """Wideband FM stereo demodulator for FM broadcast (88-108 MHz).
 
-    Wraps FMStereoDecoder with the same interface as WBFMDemodulator,
-    providing stereo decoding with pilot detection and SNR-based blending.
+    Wraps FMStereoDecoder, providing stereo decoding with pilot detection
+    and SNR-based blending.
 
     Supports higher input sample rates by using efficient FIR decimation to
     ~312.5 kHz for optimal stereo decoder performance.
