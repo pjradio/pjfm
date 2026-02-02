@@ -2,16 +2,24 @@
 """
 Phil's Weather Radio GUI
 
-A PyQt5-based spectrum analyzer and waterfall display for the Signal Hound BB60D.
-Default center frequency is 162.500 MHz (NOAA weather radio band).
-Includes NBFM demodulator for NOAA Weather Radio reception.
+A PyQt5-based spectrum analyzer and waterfall display supporting the Signal Hound BB60D
+and Icom IC-R8600. Default center frequency is 162.525 MHz (NOAA weather radio band).
+Includes NBFM demodulator for NOAA Weather Radio and WBFM stereo for FM broadcast.
 
 Usage:
-    python panadapter.py [--freq FREQ_MHZ]
+    python panadapter.py [--freq FREQ_MHZ]              # BB60D (default)
+    python panadapter.py --icom [--freq FREQ_MHZ]       # IC-R8600 16-bit
+    python panadapter.py --icom --24bit                 # IC-R8600 24-bit
+    python panadapter.py --icom --sample-rate 960000    # IC-R8600 at 960 kHz
+
+IC-R8600 sample rates: 240, 480, 960, 1920, 3840, 5120 kHz
+Note: 5.12 MHz only supports 16-bit; 24-bit available at other rates.
 """
 
 import sys
+import os
 import argparse
+import configparser
 import time
 import threading
 import numpy as np
@@ -33,11 +41,21 @@ import sounddevice as sd
 from bb60d import BB60D, BB_MIN_FREQ, BB_MAX_FREQ
 from demodulator import FMStereoDecoder
 
+# Optional IC-R8600 support
+try:
+    from icom_r8600 import IcomR8600
+except ImportError:
+    IcomR8600 = None
+
 
 # Default settings
 DEFAULT_CENTER_FREQ = 162.525e6  # NOAA weather radio (WX7)
 FREQ_STEP = 25e3  # 25 kHz step (weather channel spacing)
-SAMPLE_RATE = 625000  # 625 kHz bandwidth (40 MHz / 64)
+SAMPLE_RATE = 625000  # 625 kHz bandwidth (40 MHz / 64) - BB60D default
+
+# IC-R8600 default sample rates (lower to avoid buffer underruns)
+ICOM_SAMPLE_RATE_WEATHER = 480000    # 480 kHz for NBFM (plenty for 12.5 kHz channel)
+ICOM_SAMPLE_RATE_FM = 960000         # 960 kHz for WBFM (good for stereo decoding)
 FFT_SIZE = 4096
 WATERFALL_HISTORY = 300  # Number of rows in waterfall
 UPDATE_RATE_MS = 50  # ~20 fps
@@ -55,6 +73,77 @@ FM_BROADCAST_MAX = 108.0e6  # FM broadcast band end
 FM_BROADCAST_STEP = 100e3   # 100 kHz step for FM broadcast
 FM_BROADCAST_DEFAULT = 89.9e6  # Default FM broadcast frequency
 FM_BROADCAST_SAMPLE_RATE = 1250000  # 1.25 MHz for wider spectrum view (decimated for audio)
+
+# Configuration file path (same directory as script)
+CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'panadapter.cfg')
+
+
+def load_config():
+    """Load settings from config file.
+
+    Returns:
+        dict with settings, or empty dict if no config file exists
+    """
+    config = configparser.ConfigParser()
+    settings = {}
+
+    if os.path.exists(CONFIG_FILE):
+        try:
+            config.read(CONFIG_FILE)
+
+            if config.has_section('device'):
+                if config.has_option('device', 'radio'):
+                    settings['use_icom'] = config.get('device', 'radio').lower() == 'icom'
+                if config.has_option('device', 'bit_depth'):
+                    settings['use_24bit'] = config.getint('device', 'bit_depth') == 24
+                if config.has_option('device', 'sample_rate'):
+                    settings['sample_rate'] = config.getint('device', 'sample_rate')
+
+            if config.has_section('tuning'):
+                if config.has_option('tuning', 'frequency'):
+                    settings['frequency'] = config.getfloat('tuning', 'frequency')
+                if config.has_option('tuning', 'mode'):
+                    settings['mode'] = config.get('tuning', 'mode').lower()
+
+        except (configparser.Error, ValueError) as e:
+            print(f"Warning: Error reading config file: {e}")
+
+    return settings
+
+
+def save_config(use_icom=False, use_24bit=False, sample_rate=None,
+                frequency=None, mode='weather'):
+    """Save settings to config file.
+
+    Args:
+        use_icom: True for IC-R8600, False for BB60D
+        use_24bit: True for 24-bit I/Q (IC-R8600 only)
+        sample_rate: Sample rate in Hz
+        frequency: Center frequency in Hz
+        mode: 'weather' or 'fm_broadcast'
+    """
+    config = configparser.ConfigParser()
+
+    # Device section
+    config['device'] = {
+        'radio': 'icom' if use_icom else 'bb60d',
+        'bit_depth': '24' if use_24bit else '16',
+    }
+    if sample_rate:
+        config['device']['sample_rate'] = str(sample_rate)
+
+    # Tuning section
+    config['tuning'] = {
+        'mode': mode,
+    }
+    if frequency:
+        config['tuning']['frequency'] = f'{frequency:.0f}'
+
+    try:
+        with open(CONFIG_FILE, 'w') as f:
+            config.write(f)
+    except IOError as e:
+        print(f"Warning: Could not save config file: {e}")
 
 
 class NBFMDemodulator:
@@ -815,6 +904,10 @@ class SpectrumWidget(pg.PlotWidget):
         self._update_freq_axis()
         self.peak_data = None
 
+    def set_db_range(self, min_db, max_db):
+        """Set the Y-axis dB range."""
+        self.setYRange(min_db, max_db)
+
     def update_spectrum(self, spectrum_db):
         """Update spectrum display with new data."""
         if self.freq_axis is not None and len(spectrum_db) == len(self.freq_axis):
@@ -1101,7 +1194,11 @@ class MainWindow(QMainWindow):
     MODE_WEATHER = 'weather'  # NBFM Weather Radio
     MODE_FM_BROADCAST = 'fm_broadcast'  # WBFM FM Broadcast
 
-    def __init__(self, center_freq=DEFAULT_CENTER_FREQ):
+    # IC-R8600 available sample rates
+    ICOM_SAMPLE_RATES = [240000, 480000, 960000, 1920000, 3840000, 5120000]
+
+    def __init__(self, center_freq=DEFAULT_CENTER_FREQ, use_icom=False,
+                 sample_rate=None, use_24bit=False, initial_mode='weather'):
         super().__init__()
 
         self.center_freq = center_freq
@@ -1109,8 +1206,13 @@ class MainWindow(QMainWindow):
         self.device = None
         self.data_thread = None
 
+        # Device selection
+        self.use_icom = use_icom
+        self.use_24bit = use_24bit
+        self.requested_sample_rate = sample_rate  # User-requested sample rate
+
         # Current mode (Weather Radio vs FM Broadcast)
-        self.current_mode = self.MODE_WEATHER
+        self.current_mode = self.MODE_FM_BROADCAST if initial_mode == 'fm_broadcast' else self.MODE_WEATHER
 
         # FFT processing
         self.fft_window = np.hanning(FFT_SIZE)
@@ -1125,6 +1227,7 @@ class MainWindow(QMainWindow):
         self.tuned_freq = center_freq  # Currently tuned frequency for demod
 
         self.setup_ui()
+        self.apply_initial_mode()  # Configure UI for initial mode
         self.setup_device()
 
     def setup_ui(self):
@@ -1358,6 +1461,48 @@ class MainWindow(QMainWindow):
         QShortcut(QKeySequence('Q'), self, self.close)
         QShortcut(QKeySequence('Escape'), self, self.close)
 
+    def apply_initial_mode(self):
+        """Configure UI elements for the initial mode (before device setup)."""
+        if self.current_mode == self.MODE_FM_BROADCAST:
+            # FM Broadcast mode
+            self.fm_broadcast_btn.setChecked(True)
+            self.weather_radio_btn.setChecked(False)
+            self.setWindowTitle(f"FM Broadcast - {self.center_freq/1e6:.3f} MHz")
+            # Hide weather-specific controls
+            self.noaa_label.hide()
+            for btn in self.noaa_buttons:
+                btn.hide()
+            self.hum_filter_checkbox.hide()
+            # Show stereo indicators
+            self.stereo_label.show()
+            self.stereo_indicator.show()
+            self.snr_label.show()
+            self.snr_indicator.show()
+            # Set spectrum range for FM broadcast
+            self.spectrum_widget.set_db_range(-120, -55)
+        else:
+            # Weather Radio mode
+            self.weather_radio_btn.setChecked(True)
+            self.fm_broadcast_btn.setChecked(False)
+            self.setWindowTitle(f"Phil's Weather Radio - {self.center_freq/1e6:.3f} MHz")
+            # Show weather-specific controls
+            self.noaa_label.show()
+            for btn in self.noaa_buttons:
+                btn.show()
+            self.hum_filter_checkbox.show()
+            # Hide stereo indicators
+            self.stereo_label.hide()
+            self.stereo_indicator.hide()
+            self.snr_label.hide()
+            self.snr_indicator.hide()
+            # Set spectrum range for weather radio
+            self.spectrum_widget.set_db_range(-150, -70)
+
+        # Update frequency step buttons
+        self.update_freq_button_labels()
+        # Update tuned frequency label
+        self.tuned_freq_label.setText(f'{self.center_freq/1e6:.4f} MHz')
+
     def get_freq_step(self):
         """Get the frequency step based on current mode."""
         if self.current_mode == self.MODE_FM_BROADCAST:
@@ -1383,15 +1528,55 @@ class MainWindow(QMainWindow):
         self.waterfall_widget.plot.setXRange(center_mhz - 0.05, center_mhz + 0.05, padding=0)
 
     def setup_device(self):
-        """Initialize BB60D device and start data acquisition."""
+        """Initialize device (BB60D or IC-R8600) and start data acquisition."""
         try:
-            self.device = BB60D()
-            # Override FM frequency limits for weather radio use
-            self.device.FM_MIN_FREQ = BB_MIN_FREQ
-            self.device.FM_MAX_FREQ = BB_MAX_FREQ
+            # Determine sample rate to use
+            if self.requested_sample_rate:
+                requested_rate = self.requested_sample_rate
+            elif self.use_icom:
+                # IC-R8600-specific defaults (lower to avoid buffer underruns)
+                if self.current_mode == self.MODE_FM_BROADCAST:
+                    requested_rate = ICOM_SAMPLE_RATE_FM  # 960 kHz
+                else:
+                    requested_rate = ICOM_SAMPLE_RATE_WEATHER  # 480 kHz
+            else:
+                # BB60D default
+                requested_rate = SAMPLE_RATE  # 625 kHz for weather
 
-            self.device.open()
-            self.device.configure_iq_streaming(self.center_freq, SAMPLE_RATE)
+            if self.use_icom:
+                # IC-R8600
+                if IcomR8600 is None:
+                    raise RuntimeError("IC-R8600 support not available (pyusb not installed?)")
+
+                self.device = IcomR8600(use_24bit=self.use_24bit)
+                self.device.open()
+
+                # Use requested rate directly (it's already an IC-R8600 valid rate if from defaults)
+                # or find nearest available if user specified a custom rate
+                if self.requested_sample_rate:
+                    available_rates = sorted(self.ICOM_SAMPLE_RATES)
+                    chosen_rate = available_rates[0]
+                    for rate in available_rates:
+                        if rate >= requested_rate:
+                            chosen_rate = rate
+                            break
+                    else:
+                        chosen_rate = available_rates[-1]
+                else:
+                    chosen_rate = requested_rate
+
+                self.device.configure_iq_streaming(self.center_freq, chosen_rate)
+                device_name = f"IC-R8600 ({self.device._bit_depth}-bit)"
+            else:
+                # BB60D
+                self.device = BB60D()
+                # Override FM frequency limits for weather radio use
+                self.device.FM_MIN_FREQ = BB_MIN_FREQ
+                self.device.FM_MAX_FREQ = BB_MAX_FREQ
+
+                self.device.open()
+                self.device.configure_iq_streaming(self.center_freq, requested_rate)
+                device_name = "BB60D"
 
             # Update bandwidth to actual device sample rate (for FFT frequency axis)
             # Note: iq_sample_rate is the FFT span, iq_bandwidth is the filter bandwidth
@@ -1433,7 +1618,7 @@ class MainWindow(QMainWindow):
             self.data_thread.enable_demod(True)
             self.audio_output.start()
 
-            self.status_label.setText(f'Running - {self.device.iq_sample_rate/1e3:.1f} kHz')
+            self.status_label.setText(f'{device_name} - {self.device.iq_sample_rate/1e3:.1f} kHz')
 
         except Exception as e:
             self.status_label.setText(f'Error: {e}')
@@ -1528,8 +1713,13 @@ class MainWindow(QMainWindow):
 
     def set_frequency(self, freq):
         """Set new center frequency."""
-        # Clamp to valid range
-        freq = max(BB_MIN_FREQ, min(BB_MAX_FREQ, freq))
+        # Clamp to valid range based on device
+        if self.use_icom:
+            # IC-R8600: 10 kHz to 3 GHz
+            freq = max(10e3, min(3000e6, freq))
+        else:
+            # BB60D
+            freq = max(BB_MIN_FREQ, min(BB_MAX_FREQ, freq))
 
         if freq != self.center_freq:
             self.center_freq = freq
@@ -1618,7 +1808,13 @@ class MainWindow(QMainWindow):
         # Get new frequency and sample rate for this mode
         if new_mode == self.MODE_FM_BROADCAST:
             new_freq = FM_BROADCAST_DEFAULT
-            new_sample_rate = FM_BROADCAST_SAMPLE_RATE
+            # Use IC-R8600-specific default if no rate requested
+            if self.requested_sample_rate:
+                new_sample_rate = self.requested_sample_rate
+            elif self.use_icom:
+                new_sample_rate = ICOM_SAMPLE_RATE_FM  # 960 kHz
+            else:
+                new_sample_rate = FM_BROADCAST_SAMPLE_RATE
             # Hide NOAA presets and hum filter (not applicable to FM broadcast)
             self.noaa_label.hide()
             for btn in self.noaa_buttons:
@@ -1626,12 +1822,30 @@ class MainWindow(QMainWindow):
             self.hum_filter_checkbox.hide()
         else:
             new_freq = DEFAULT_CENTER_FREQ
-            new_sample_rate = SAMPLE_RATE
+            # Use IC-R8600-specific default if no rate requested
+            if self.requested_sample_rate:
+                new_sample_rate = self.requested_sample_rate
+            elif self.use_icom:
+                new_sample_rate = ICOM_SAMPLE_RATE_WEATHER  # 480 kHz
+            else:
+                new_sample_rate = SAMPLE_RATE
             # Show NOAA presets and hum filter
             self.noaa_label.show()
             for btn in self.noaa_buttons:
                 btn.show()
             self.hum_filter_checkbox.show()
+
+        # For IC-R8600 with user-specified rate, find nearest available
+        if self.use_icom and self.requested_sample_rate:
+            available_rates = sorted(self.ICOM_SAMPLE_RATES)
+            chosen_rate = available_rates[0]
+            for rate in available_rates:
+                if rate >= new_sample_rate:
+                    chosen_rate = rate
+                    break
+            else:
+                chosen_rate = available_rates[-1]
+            new_sample_rate = chosen_rate
 
         # Reconfigure device with new sample rate and frequency
         if self.device and self.device.streaming_mode:
@@ -1667,6 +1881,8 @@ class MainWindow(QMainWindow):
             self.stereo_indicator.show()
             self.snr_label.show()
             self.snr_indicator.show()
+            # Adjust spectrum range for stronger FM broadcast signals
+            self.spectrum_widget.set_db_range(-120, -55)
         else:
             self.demodulator = self.nbfm_demodulator
             self.setWindowTitle(f"Phil's Weather Radio - {new_freq/1e6:.3f} MHz")
@@ -1678,6 +1894,8 @@ class MainWindow(QMainWindow):
             self.stereo_indicator.hide()
             self.snr_label.hide()
             self.snr_indicator.hide()
+            # Restore spectrum range for weaker weather radio signals
+            self.spectrum_widget.set_db_range(-150, -70)
 
         # Update tuned frequency to match center
         self.tuned_freq = new_freq
@@ -1687,7 +1905,12 @@ class MainWindow(QMainWindow):
 
         # Update UI
         self.freq_entry.setText(f'{new_freq/1e6:.3f}')
-        self.status_label.setText(f'Running - {self.bandwidth/1e3:.1f} kHz')
+        if self.use_icom:
+            bit_depth = getattr(self.device, '_bit_depth', 16)
+            device_name = f"IC-R8600 ({bit_depth}-bit)"
+        else:
+            device_name = "BB60D"
+        self.status_label.setText(f'{device_name} - {self.bandwidth/1e3:.1f} kHz')
 
         # Configure demodulator
         self.demodulator.set_squelch(self.squelch_slider.value())
@@ -1764,6 +1987,19 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event):
         """Clean up on window close."""
+        # Save current settings to config file
+        sample_rate = None
+        if self.device and hasattr(self.device, 'iq_sample_rate'):
+            sample_rate = self.device.iq_sample_rate
+
+        save_config(
+            use_icom=self.use_icom,
+            use_24bit=self.use_24bit,
+            sample_rate=sample_rate,
+            frequency=self.center_freq,
+            mode=self.current_mode
+        )
+
         # Stop audio output
         if self.audio_output:
             self.audio_output.stop()
@@ -1782,9 +2018,79 @@ class MainWindow(QMainWindow):
 
 def main():
     parser = argparse.ArgumentParser(description="Phil's Weather Radio GUI")
-    parser.add_argument('--freq', type=float, default=DEFAULT_CENTER_FREQ/1e6,
-                        help='Center frequency in MHz (default: 162.500)')
+    parser.add_argument('--freq', type=float, default=None,
+                        help='Center frequency in MHz (default: from config or 162.525)')
+    parser.add_argument('--icom', action='store_true',
+                        help='Use Icom IC-R8600 instead of BB60D')
+    parser.add_argument('--bb60d', action='store_true',
+                        help='Use SignalHound BB60D (default)')
+    parser.add_argument('--sample-rate', type=int, default=None,
+                        metavar='RATE',
+                        help='Sample rate in Hz (IC-R8600: 240000, 480000, 960000, '
+                             '1920000, 3840000, 5120000)')
+    parser.add_argument('--24bit', action='store_true', dest='use_24bit',
+                        help='Use 24-bit I/Q samples (IC-R8600 only, default: 16-bit)')
+    parser.add_argument('--mode', choices=['weather', 'fm'], default=None,
+                        help='Initial mode: weather or fm (default: from config)')
     args = parser.parse_args()
+
+    # Load saved config
+    config = load_config()
+
+    # Apply config defaults, then override with command-line arguments
+    use_icom = config.get('use_icom', False)
+    use_24bit = config.get('use_24bit', False)
+    sample_rate = config.get('sample_rate', None)
+    mode = config.get('mode', 'weather')
+
+    # Determine initial frequency based on mode
+    if 'frequency' in config:
+        center_freq = config['frequency']
+    elif mode == 'fm_broadcast':
+        center_freq = FM_BROADCAST_DEFAULT
+    else:
+        center_freq = DEFAULT_CENTER_FREQ
+
+    # Command-line arguments override config
+    if args.icom:
+        use_icom = True
+    elif args.bb60d:
+        use_icom = False
+
+    if args.use_24bit:
+        use_24bit = True
+
+    if args.sample_rate is not None:
+        sample_rate = args.sample_rate
+
+    if args.freq is not None:
+        center_freq = args.freq * 1e6
+
+    if args.mode is not None:
+        mode = 'fm_broadcast' if args.mode == 'fm' else 'weather'
+
+    # Validate conflicting options
+    if args.icom and args.bb60d:
+        print("Error: Cannot specify both --icom and --bb60d")
+        sys.exit(1)
+
+    # Validate 24-bit requires IC-R8600
+    if use_24bit and not use_icom:
+        print("Error: --24bit requires IC-R8600 (use --icom)")
+        sys.exit(1)
+
+    # Validate sample rate for IC-R8600
+    if sample_rate and use_icom:
+        valid_rates = [240000, 480000, 960000, 1920000, 3840000, 5120000]
+        if sample_rate not in valid_rates:
+            print(f"Warning: Sample rate {sample_rate} not in IC-R8600 valid rates.")
+            print(f"  Valid rates: {', '.join(str(r) for r in valid_rates)}")
+            print(f"  Will use nearest available rate.")
+
+    # Check for 24-bit at 5.12 MSPS (not supported)
+    if use_24bit and sample_rate == 5120000:
+        print("Error: 24-bit mode not supported at 5.12 MSPS (hardware limitation)")
+        sys.exit(1)
 
     # Configure pyqtgraph for performance
     pg.setConfigOptions(antialias=False, useOpenGL=True)
@@ -1792,7 +2098,13 @@ def main():
     app = QApplication(sys.argv)
     app.setStyle('Fusion')  # Consistent cross-platform look
 
-    window = MainWindow(center_freq=args.freq * 1e6)
+    window = MainWindow(
+        center_freq=center_freq,
+        use_icom=use_icom,
+        sample_rate=sample_rate,
+        use_24bit=use_24bit,
+        initial_mode=mode
+    )
     window.show()
 
     sys.exit(app.exec_())
