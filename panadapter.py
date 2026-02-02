@@ -1079,7 +1079,7 @@ class MainWindow(QMainWindow):
 
     def setup_ui(self):
         """Initialize the user interface."""
-        self.setWindowTitle(f"Phil's Weather Radio - {self.center_freq/1e6:.3f} MHz")
+        self.setWindowTitle(f"Phil's Panadapter - Weather Radio - {self.center_freq/1e6:.3f} MHz")
         self.setGeometry(100, 100, 2000, 1500)
 
         # Central widget and layout
@@ -1314,7 +1314,7 @@ class MainWindow(QMainWindow):
             # FM Broadcast mode
             self.fm_broadcast_btn.setChecked(True)
             self.weather_radio_btn.setChecked(False)
-            self.setWindowTitle(f"FM Broadcast - {self.center_freq/1e6:.3f} MHz")
+            self.setWindowTitle(f"Phil's Panadapter - FM Broadcast - {self.center_freq/1e6:.3f} MHz")
             # Hide weather-specific controls
             self.noaa_label.hide()
             for btn in self.noaa_buttons:
@@ -1331,7 +1331,7 @@ class MainWindow(QMainWindow):
             # Weather Radio mode
             self.weather_radio_btn.setChecked(True)
             self.fm_broadcast_btn.setChecked(False)
-            self.setWindowTitle(f"Phil's Weather Radio - {self.center_freq/1e6:.3f} MHz")
+            self.setWindowTitle(f"Phil's Panadapter - Weather Radio - {self.center_freq/1e6:.3f} MHz")
             # Show weather-specific controls
             self.noaa_label.show()
             for btn in self.noaa_buttons:
@@ -1596,9 +1596,9 @@ class MainWindow(QMainWindow):
             # Update UI
             self.freq_entry.setText(f'{freq/1e6:.3f}')
             if self.current_mode == self.MODE_FM_BROADCAST:
-                self.setWindowTitle(f"FM Broadcast - {freq/1e6:.3f} MHz")
+                self.setWindowTitle(f"Phil's Panadapter - FM Broadcast - {freq/1e6:.3f} MHz")
             else:
-                self.setWindowTitle(f"Phil's Weather Radio - {freq/1e6:.3f} MHz")
+                self.setWindowTitle(f"Phil's Panadapter - Weather Radio - {freq/1e6:.3f} MHz")
 
             # Reset averaging on frequency change
             self.spectrum_avg = None
@@ -1680,7 +1680,7 @@ class MainWindow(QMainWindow):
         # Select the appropriate demodulator and audio channels
         if new_mode == self.MODE_FM_BROADCAST:
             self.demodulator = self.wbfm_demodulator
-            self.setWindowTitle(f"FM Broadcast - {new_freq/1e6:.3f} MHz")
+            self.setWindowTitle(f"Phil's Panadapter - FM Broadcast - {new_freq/1e6:.3f} MHz")
             # Switch to stereo audio output
             if self.audio_output:
                 self.audio_output.set_channels(2)
@@ -1693,7 +1693,7 @@ class MainWindow(QMainWindow):
             self.spectrum_widget.set_db_range(-120, -55)
         else:
             self.demodulator = self.nbfm_demodulator
-            self.setWindowTitle(f"Phil's Weather Radio - {new_freq/1e6:.3f} MHz")
+            self.setWindowTitle(f"Phil's Panadapter - Weather Radio - {new_freq/1e6:.3f} MHz")
             # Switch to mono audio output
             if self.audio_output:
                 self.audio_output.set_channels(1)
