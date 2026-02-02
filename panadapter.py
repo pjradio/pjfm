@@ -217,6 +217,14 @@ class NBFMDemodulator:
         # Audio output buffer
         self.audio_buffer = deque(maxlen=int(audio_sample_rate * 0.5))  # 500ms buffer
 
+        # Peak amplitude tracking
+        self._peak_amplitude = 0.0
+
+    @property
+    def peak_amplitude(self):
+        """Returns peak amplitude (before clipping)."""
+        return self._peak_amplitude
+
     def set_tuned_offset(self, offset_hz):
         """Set the tuning offset from center frequency."""
         self.tuned_offset = offset_hz
@@ -326,8 +334,13 @@ class NBFMDemodulator:
         num_output_samples = int(len(audio_filtered) * self.resample_ratio)
         if num_output_samples > 0:
             audio_resampled = signal.resample(audio_filtered, num_output_samples)
-            # Normalize audio level
-            audio_resampled = np.clip(audio_resampled * 0.5, -1.0, 1.0)
+            # Scale audio
+            audio_resampled = audio_resampled * 0.5
+            # Track peak amplitude before clipping (fast attack, slow decay)
+            peak = np.max(np.abs(audio_resampled))
+            self._peak_amplitude = max(0.95 * self._peak_amplitude, peak)
+            # Clip to valid range
+            audio_resampled = np.clip(audio_resampled, -1.0, 1.0)
             return audio_resampled.astype(np.float32)
 
         return None
@@ -340,6 +353,7 @@ class NBFMDemodulator:
         self.prev_sample = 1 + 0j
         self.deemph_state = 0.0
         self.audio_buffer.clear()
+        self._peak_amplitude = 0.0
 
 
 class WBFMStereoDemodulator:
@@ -410,6 +424,11 @@ class WBFMStereoDemodulator:
     def snr_db(self):
         """Returns SNR estimate in dB."""
         return self.stereo_decoder.snr_db
+
+    @property
+    def peak_amplitude(self):
+        """Returns peak amplitude (before limiting). >0.8 means limiter active."""
+        return self.stereo_decoder.peak_amplitude
 
     def process(self, iq_data):
         """
@@ -1054,6 +1073,133 @@ class SMeterWidget(QFrame):
         self.dbm_label.setText(f'{dbm:.0f} dBm')
 
 
+class PeakMeterWidget(QFrame):
+    """Audio peak meter widget showing level and limiter activity.
+
+    Shows audio peak level from 0.0 to 1.0+, with indication when
+    the soft limiter (threshold 0.8) is being activated.
+    """
+
+    LIMITER_THRESHOLD = 0.8  # Soft limiter kicks in above this level
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setFrameStyle(QFrame.StyledPanel | QFrame.Sunken)
+        self.peak_level = 0.0
+        self.peak_hold = 0.0
+        self.peak_hold_time = 0
+
+        # Fixed size
+        self.setFixedHeight(42)
+        self.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
+
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(8, 4, 8, 4)
+
+        # Label
+        label = QLabel('Peak:')
+        label.setStyleSheet('font-weight: bold;')
+        layout.addWidget(label)
+
+        # Peak meter bar using pyqtgraph
+        self.meter_bar = pg.PlotWidget()
+        self.meter_bar.setFixedHeight(30)
+        self.meter_bar.setFixedWidth(150)
+        self.meter_bar.setBackground('#1a1a1a')
+        self.meter_bar.hideAxis('left')
+        self.meter_bar.hideAxis('bottom')
+        self.meter_bar.setMouseEnabled(False, False)
+        self.meter_bar.setMenuEnabled(False)
+
+        # Create bar item for current level
+        self.bar_item = pg.BarGraphItem(x=[0], height=[0], width=0.8, brush='#22aa44')
+        self.meter_bar.addItem(self.bar_item)
+
+        # Create bar item for peak hold (thin line)
+        self.peak_hold_item = pg.BarGraphItem(x=[0], height=[1], width=0.02, brush='#ffff00')
+        self.meter_bar.addItem(self.peak_hold_item)
+
+        # Set range: 0 to 1.2 (allow showing over-limit)
+        self.meter_bar.setXRange(0, 1.2, padding=0)
+        self.meter_bar.setYRange(0, 1, padding=0)
+
+        # Add threshold line at 0.8 (limiter threshold)
+        threshold_line = pg.InfiniteLine(
+            pos=self.LIMITER_THRESHOLD, angle=90,
+            pen=pg.mkPen('#ff6600', width=2, style=Qt.DashLine)
+        )
+        self.meter_bar.addItem(threshold_line)
+
+        # Add clipping line at 1.0
+        clip_line = pg.InfiniteLine(
+            pos=1.0, angle=90,
+            pen=pg.mkPen('#ff0000', width=2)
+        )
+        self.meter_bar.addItem(clip_line)
+
+        layout.addWidget(self.meter_bar)
+
+        # Level readout
+        self.level_label = QLabel('0.00')
+        self.level_label.setFixedWidth(45)
+        self.level_label.setStyleSheet('font-family: monospace; font-weight: bold;')
+        layout.addWidget(self.level_label)
+
+        # Limiter indicator
+        self.limiter_label = QLabel('')
+        self.limiter_label.setFixedWidth(50)
+        self.limiter_label.setStyleSheet('font-family: monospace; font-weight: bold; color: #ff6600;')
+        layout.addWidget(self.limiter_label)
+
+        layout.addStretch()
+
+    def set_level(self, peak):
+        """Set the peak level (0.0 to 1.0+) and update display."""
+        self.peak_level = peak
+
+        # Update peak hold with slow decay
+        if peak > self.peak_hold:
+            self.peak_hold = peak
+            self.peak_hold_time = 30  # Hold for ~30 frames (~1 second at 30fps)
+        elif self.peak_hold_time > 0:
+            self.peak_hold_time -= 1
+        else:
+            self.peak_hold = max(0, self.peak_hold - 0.02)  # Slow decay
+
+        # Clamp display value
+        display_level = min(peak, 1.2)
+        display_hold = min(self.peak_hold, 1.2)
+
+        # Color based on level
+        if peak < 0.5:
+            color = '#22aa44'  # Green - normal
+        elif peak < self.LIMITER_THRESHOLD:
+            color = '#aaaa22'  # Yellow - getting hot
+        elif peak < 1.0:
+            color = '#ff6600'  # Orange - limiter active
+        else:
+            color = '#ff0000'  # Red - clipping
+
+        # Update bar
+        self.bar_item.setOpts(x=[display_level/2], height=[1], width=display_level, brush=color)
+
+        # Update peak hold marker
+        self.peak_hold_item.setOpts(x=[display_hold], height=[1], width=0.02, brush='#ffff00')
+
+        # Update text
+        self.level_label.setText(f'{peak:.2f}')
+
+        # Update limiter indicator
+        if peak >= 1.0:
+            self.limiter_label.setText('CLIP')
+            self.limiter_label.setStyleSheet('font-family: monospace; font-weight: bold; color: #ff0000;')
+        elif peak >= self.LIMITER_THRESHOLD:
+            self.limiter_label.setText('LIMIT')
+            self.limiter_label.setStyleSheet('font-family: monospace; font-weight: bold; color: #ff6600;')
+        else:
+            self.limiter_label.setText('')
+
+
 class MainWindow(QMainWindow):
     """Main application window with spectrum and waterfall displays."""
 
@@ -1289,9 +1435,22 @@ class MainWindow(QMainWindow):
 
         main_layout.addWidget(demod_frame)
 
+        # Meter bar (S-meter and peak meter side by side)
+        meter_frame = QFrame()
+        meter_layout = QHBoxLayout(meter_frame)
+        meter_layout.setContentsMargins(0, 0, 0, 0)
+        meter_layout.setSpacing(10)
+
         # S-meter bar
         self.smeter = SMeterWidget()
-        main_layout.addWidget(self.smeter)
+        meter_layout.addWidget(self.smeter)
+
+        # Peak meter bar
+        self.peak_meter = PeakMeterWidget()
+        meter_layout.addWidget(self.peak_meter)
+
+        meter_layout.addStretch()
+        main_layout.addWidget(meter_frame)
 
         # Splitter for spectrum and waterfall
         splitter = QSplitter(Qt.Vertical)
@@ -1567,6 +1726,9 @@ class MainWindow(QMainWindow):
         # Update S-meter display
         self.smeter.set_level(signal_db)
 
+        # Update peak meter with audio peak from demodulator
+        self._update_peak_meter()
+
         # Update stereo/SNR indicators if in FM Broadcast mode
         if self.current_mode == self.MODE_FM_BROADCAST:
             self._update_stereo_indicators()
@@ -1594,6 +1756,15 @@ class MainWindow(QMainWindow):
         snr = self.wbfm_demodulator.snr_db
         self.snr_indicator.setText(f'{snr:2.0f} dB')
         self.snr_indicator.setStyleSheet('font-family: monospace; color: black;')
+
+    def _update_peak_meter(self):
+        """Update peak meter with audio peak level from demodulator."""
+        if self.demodulator is None:
+            return
+
+        # Get peak amplitude from the active demodulator
+        peak = self.demodulator.peak_amplitude
+        self.peak_meter.set_level(peak)
 
     def tune(self, delta):
         """Change frequency by delta Hz."""
