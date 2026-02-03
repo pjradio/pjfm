@@ -564,14 +564,6 @@ class IcomR8600:
                 if data:
                     with self._iq_lock:
                         self._iq_buffer.append(bytes(data))
-                        # Prevent unbounded buffer growth if fetch_iq() is slow
-                        total_size = sum(len(chunk) for chunk in self._iq_buffer)
-                        if total_size > MAX_IQ_BUFFER_BYTES:
-                            self._buffer_overflow_count += 1
-                            # Drop oldest chunks to get below half the limit
-                            while (self._iq_buffer and
-                                   sum(len(chunk) for chunk in self._iq_buffer) > MAX_IQ_BUFFER_BYTES // 2):
-                                self._iq_buffer.pop(0)
             except usb.core.USBTimeoutError:
                 continue
             except usb.core.USBError:
@@ -579,6 +571,67 @@ class IcomR8600:
                     self.recent_sample_loss += 1
                     self.total_sample_loss += 1
                 break
+
+    def _parse_16bit_block(self, data: bytes) -> tuple:
+        """
+        Parse a block of 16-bit I/Q samples.
+
+        Args:
+            data: bytes or memoryview of raw bytes (must be multiple of 4 bytes)
+
+        Returns:
+            Tuple of (i_array, q_array) as int16 numpy arrays
+        """
+        n_bytes = len(data)
+        if n_bytes == 0:
+            return np.array([], dtype=np.int16), np.array([], dtype=np.int16)
+
+        # Convert memoryview to bytes for numpy compatibility
+        if isinstance(data, memoryview):
+            data = bytes(data)
+
+        # Parse as interleaved int16 I/Q pairs
+        samples = np.frombuffer(data, dtype=np.int16)
+        i = samples[0::2]  # Even indices
+        q = samples[1::2]  # Odd indices
+
+        return i, q
+
+    def _parse_24bit_block(self, data: bytes) -> tuple:
+        """
+        Parse a block of 24-bit I/Q samples.
+
+        Args:
+            data: bytes or memoryview of raw bytes (must be multiple of 6 bytes)
+
+        Returns:
+            Tuple of (i_array, q_array) as int32 numpy arrays
+        """
+        n_bytes = len(data)
+        if n_bytes == 0:
+            return np.array([], dtype=np.int32), np.array([], dtype=np.int32)
+
+        # Convert memoryview to bytes for numpy compatibility
+        if isinstance(data, memoryview):
+            data = bytes(data)
+
+        b = np.frombuffer(data, dtype=np.uint8).reshape(-1, 6)
+
+        # Unpack 24-bit little-endian I and Q values
+        i_u = (b[:, 0].astype(np.uint32) |
+               (b[:, 1].astype(np.uint32) << 8) |
+               (b[:, 2].astype(np.uint32) << 16))
+        q_u = (b[:, 3].astype(np.uint32) |
+               (b[:, 4].astype(np.uint32) << 8) |
+               (b[:, 5].astype(np.uint32) << 16))
+
+        # Sign-extend from 24-bit to 32-bit
+        i = i_u.astype(np.int32)
+        q = q_u.astype(np.int32)
+        i[i_u & 0x800000 != 0] -= 0x1000000
+        q[q_u & 0x800000 != 0] -= 0x1000000
+
+        return i, q
 
     def fetch_iq(self, num_samples=8192):
         """
@@ -686,124 +739,167 @@ class IcomR8600:
         sync_interval = SYNC_INTERVAL.get(self.iq_sample_rate, 1024)
 
         if self._bit_depth == 16:
-            parsed_i = []
-            parsed_q = []
+            # 16-bit parsing: sync intervals are deterministic, so we can use
+            # a simple block-based approach. After initial alignment, buffer
+            # starts right after a sync. Each block is exactly:
+            #   sync_interval * 4 bytes of samples + 4 bytes sync pattern
+            block_data_bytes = sync_interval * sample_size  # bytes of sample data per block
+            block_total_bytes = block_data_bytes + sync_len  # includes trailing sync
 
-            while len(parsed_i) < num_samples and buf_len - idx >= sample_size:
-                # Check for sync pattern at current position
-                if buf[idx:idx + sync_len] == sync_bytes:
-                    idx += sync_len
-                    self._samples_since_sync = 0
-                    continue
+            # First, handle any partial block from previous fetch
+            # _samples_since_sync tracks how many samples we've consumed in current block
+            samples_remaining_in_block = sync_interval - self._samples_since_sync
+            bytes_remaining_in_block = samples_remaining_in_block * sample_size
 
-                # Periodic alignment check: if we've parsed enough samples,
-                # we should be near a sync. If not at expected position, search for it.
-                if self._samples_since_sync > 0 and self._samples_since_sync >= sync_interval:
-                    # Search window: enough bytes to handle drift of ~50 samples
-                    # Higher sample rates may have more timing jitter
-                    search_window = sample_size * 50 + sync_len
-                    # Track if we have insufficient buffer for reliable sync search
-                    if buf_len - idx < search_window:
-                        self._sync_short_buf += 1
-                    # We should have seen a sync by now - search for it
-                    sync_pos = buf[idx:idx + search_window].find(sync_bytes)
-                    if sync_pos == -1:
-                        # No sync where expected - we're misaligned, search further
-                        self._sync_misses += 1
-                        sync_pos = buf[idx:].find(sync_bytes)
-                        if sync_pos != -1:
-                            idx += sync_pos + sync_len
-                            self._samples_since_sync = 0
-                            continue
-                        else:
-                            # No sync in buffer - skip some bytes and try again
-                            idx += sample_size
-                            continue
-                    elif sync_pos == 0:
-                        # Sync right here - good
-                        idx += sync_len
-                        self._samples_since_sync = 0
-                        continue
-                    else:
-                        # Sync nearby but not at position 0 - we drifted
-                        self._sync_misses += 1
-                        idx += sync_pos + sync_len
-                        self._samples_since_sync = 0
-                        continue
-
-                i = int.from_bytes(buf[idx:idx + 2], "little", signed=True)
-                q = int.from_bytes(buf[idx + 2:idx + 4], "little", signed=True)
-                idx += 4
-                # Track samples consumed, even if later discarded
-                self._samples_since_sync += 1
-                # Filter invalid samples (value -32768 only appears in sync)
-                if i == -32768 or q == -32768:
-                    continue
-                parsed_i.append(i)
-                parsed_q.append(q)
-        else:
             parsed_i_blocks = []
             parsed_q_blocks = []
             parsed_count = 0
 
-            while parsed_count < num_samples and buf_len - idx >= sample_size:
-                # If we're due for a sync, require it at the expected position
+            # Consume remainder of partial block if any
+            if self._samples_since_sync > 0 and samples_remaining_in_block > 0:
+                samples_to_take = min(samples_remaining_in_block, num_samples, (buf_len - idx) // sample_size)
+                if samples_to_take > 0:
+                    block = memoryview(buf)[idx:idx + samples_to_take * sample_size]
+                    i_arr, q_arr = self._parse_16bit_block(block)
+                    if i_arr.size:
+                        parsed_i_blocks.append(i_arr)
+                        parsed_q_blocks.append(q_arr)
+                        parsed_count += i_arr.size
+                    idx += samples_to_take * sample_size
+                    self._samples_since_sync += samples_to_take
+
+                # If we completed the block, skip the sync pattern
                 if self._samples_since_sync >= sync_interval:
-                    if buf_len - idx < sync_len:
-                        break
-                    if buf[idx:idx + sync_len] == sync_bytes:
-                        idx += sync_len
-                        self._samples_since_sync = 0
-                        continue
+                    if buf_len - idx >= sync_len:
+                        if buf[idx:idx + sync_len] == sync_bytes:
+                            idx += sync_len
+                            self._samples_since_sync = 0
+                        else:
+                            # Unexpected: sync not where expected, re-align
+                            self._sync_misses += 1
+                            self._iq_aligned = False
 
-                    # Missing expected sync - search ahead to resync
-                    self._sync_misses += 1
-                    sync_pos = buf[idx:].find(sync_bytes)
-                    if sync_pos == -1:
-                        break
-                    idx += sync_pos + sync_len
+            # Process complete blocks
+            while (parsed_count < num_samples and
+                   self._iq_aligned and
+                   buf_len - idx >= block_total_bytes):
+                # Extract sample data (sync_interval samples)
+                samples_to_take = min(sync_interval, num_samples - parsed_count)
+                block = memoryview(buf)[idx:idx + samples_to_take * sample_size]
+                i_arr, q_arr = self._parse_16bit_block(block)
+                if i_arr.size:
+                    parsed_i_blocks.append(i_arr)
+                    parsed_q_blocks.append(q_arr)
+                    parsed_count += i_arr.size
+                idx += sync_interval * sample_size
+
+                # Verify and skip sync pattern
+                if buf[idx:idx + sync_len] == sync_bytes:
+                    idx += sync_len
                     self._samples_since_sync = 0
-                    continue
-
-                remaining_samples = num_samples - parsed_count
-                samples_until_sync = sync_interval - self._samples_since_sync
-                available_samples = (buf_len - idx) // sample_size
-                samples_to_take = min(remaining_samples, samples_until_sync, available_samples)
-                if samples_to_take <= 0:
+                else:
+                    # Sync not where expected - flag for re-alignment
+                    self._sync_misses += 1
+                    self._iq_aligned = False
                     break
 
+            # Handle partial block at end (not enough data for full block + sync)
+            if (parsed_count < num_samples and
+                self._iq_aligned and
+                buf_len - idx >= sample_size):
+                # Take as many samples as we can from the partial block
+                available_samples = (buf_len - idx) // sample_size
+                samples_to_take = min(available_samples, num_samples - parsed_count, sync_interval)
+                if samples_to_take > 0:
+                    block = memoryview(buf)[idx:idx + samples_to_take * sample_size]
+                    i_arr, q_arr = self._parse_16bit_block(block)
+                    if i_arr.size:
+                        parsed_i_blocks.append(i_arr)
+                        parsed_q_blocks.append(q_arr)
+                        parsed_count += i_arr.size
+                    idx += samples_to_take * sample_size
+                    self._samples_since_sync = samples_to_take
+        else:
+            # 24-bit parsing: sync intervals are deterministic, so we can use
+            # a simple block-based approach. After initial alignment, buffer
+            # starts right after a sync. Each block is exactly:
+            #   sync_interval * 6 bytes of samples + 6 bytes sync pattern
+            block_data_bytes = sync_interval * sample_size  # bytes of sample data per block
+            block_total_bytes = block_data_bytes + sync_len  # includes trailing sync
+
+            # First, handle any partial block from previous fetch
+            # _samples_since_sync tracks how many samples we've consumed in current block
+            samples_remaining_in_block = sync_interval - self._samples_since_sync
+            bytes_remaining_in_block = samples_remaining_in_block * sample_size
+
+            parsed_i_blocks = []
+            parsed_q_blocks = []
+            parsed_count = 0
+
+            # Consume remainder of partial block if any
+            if self._samples_since_sync > 0 and samples_remaining_in_block > 0:
+                samples_to_take = min(samples_remaining_in_block, num_samples, (buf_len - idx) // sample_size)
+                if samples_to_take > 0:
+                    block = memoryview(buf)[idx:idx + samples_to_take * sample_size]
+                    i_arr, q_arr = self._parse_24bit_block(block)
+                    if i_arr.size:
+                        parsed_i_blocks.append(i_arr)
+                        parsed_q_blocks.append(q_arr)
+                        parsed_count += i_arr.size
+                    idx += samples_to_take * sample_size
+                    self._samples_since_sync += samples_to_take
+
+                # If we completed the block, skip the sync pattern
+                if self._samples_since_sync >= sync_interval:
+                    if buf_len - idx >= sync_len:
+                        if buf[idx:idx + sync_len] == sync_bytes:
+                            idx += sync_len
+                            self._samples_since_sync = 0
+                        else:
+                            # Unexpected: sync not where expected, re-align
+                            self._sync_misses += 1
+                            self._iq_aligned = False
+
+            # Process complete blocks
+            while (parsed_count < num_samples and
+                   self._iq_aligned and
+                   buf_len - idx >= block_total_bytes):
+                # Extract sample data (sync_interval samples)
+                samples_to_take = min(sync_interval, num_samples - parsed_count)
                 block = memoryview(buf)[idx:idx + samples_to_take * sample_size]
-                b = np.frombuffer(block, dtype=np.uint8).reshape(-1, 6)
-                i_u = (b[:, 0].astype(np.uint32) |
-                       (b[:, 1].astype(np.uint32) << 8) |
-                       (b[:, 2].astype(np.uint32) << 16))
-                q_u = (b[:, 3].astype(np.uint32) |
-                       (b[:, 4].astype(np.uint32) << 8) |
-                       (b[:, 5].astype(np.uint32) << 16))
+                i_arr, q_arr = self._parse_24bit_block(block)
+                if i_arr.size:
+                    parsed_i_blocks.append(i_arr)
+                    parsed_q_blocks.append(q_arr)
+                    parsed_count += i_arr.size
+                idx += sync_interval * sample_size
 
-                i = i_u.astype(np.int32)
-                q = q_u.astype(np.int32)
-                i_sign = (i_u & 0x800000) != 0
-                q_sign = (q_u & 0x800000) != 0
-                i[i_sign] -= 0x1000000
-                q[q_sign] -= 0x1000000
+                # Verify and skip sync pattern
+                if buf[idx:idx + sync_len] == sync_bytes:
+                    idx += sync_len
+                    self._samples_since_sync = 0
+                else:
+                    # Sync not where expected - flag for re-alignment
+                    self._sync_misses += 1
+                    self._iq_aligned = False
+                    break
 
-                valid = ((i >= -8387967) & (i <= 8387966) &
-                         (q >= -8387967) & (q <= 8387966))
-                invalid_count = int(np.size(valid) - np.count_nonzero(valid))
-                if invalid_count:
-                    self._sync_invalid_24 += invalid_count
-
-                i = i[valid]
-                q = q[valid]
-
-                idx += samples_to_take * sample_size
-                self._samples_since_sync += samples_to_take
-
-                if i.size:
-                    parsed_i_blocks.append(i)
-                    parsed_q_blocks.append(q)
-                    parsed_count += i.size
+            # Handle partial block at end (not enough data for full block + sync)
+            if (parsed_count < num_samples and
+                self._iq_aligned and
+                buf_len - idx >= sample_size):
+                # Take as many samples as we can from the partial block
+                available_samples = (buf_len - idx) // sample_size
+                samples_to_take = min(available_samples, num_samples - parsed_count, sync_interval)
+                if samples_to_take > 0:
+                    block = memoryview(buf)[idx:idx + samples_to_take * sample_size]
+                    i_arr, q_arr = self._parse_24bit_block(block)
+                    if i_arr.size:
+                        parsed_i_blocks.append(i_arr)
+                        parsed_q_blocks.append(q_arr)
+                        parsed_count += i_arr.size
+                    idx += samples_to_take * sample_size
+                    self._samples_since_sync = samples_to_take
 
         # Remove parsed bytes from buffer
         if idx > 0:
@@ -811,9 +907,9 @@ class IcomR8600:
 
         # Convert to complex samples
         if self._bit_depth == 16:
-            if parsed_i:
-                i_arr = np.asarray(parsed_i, dtype=np.int16).astype(np.float32)
-                q_arr = np.asarray(parsed_q, dtype=np.int16).astype(np.float32)
+            if parsed_i_blocks:
+                i_arr = np.concatenate(parsed_i_blocks).astype(np.float32)
+                q_arr = np.concatenate(parsed_q_blocks).astype(np.float32)
                 iq = (i_arr + 1j * q_arr) / 32768.0
             else:
                 iq = np.zeros(0, dtype=np.complex64)
