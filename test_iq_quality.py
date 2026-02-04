@@ -23,7 +23,7 @@ def parse_args():
         "freq_mhz",
         nargs="?",
         type=float,
-        default=88.1,
+        default=89.9,
         help="Center frequency in MHz (default: 88.1)"
     )
     parser.add_argument(
