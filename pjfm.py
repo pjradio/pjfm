@@ -574,7 +574,7 @@ class FMRadio:
     CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'pjfm.cfg')
 
     def __init__(self, initial_freq=89.9e6, use_icom=False, use_24bit=False, preamp=None,
-                 rds_enabled=False, realtime=True):
+                 rds_enabled=True, realtime=True):
         """
         Initialize FM Radio.
 
@@ -617,11 +617,11 @@ class FMRadio:
         self.rds_enabled = False
         self.rds_data = {}
 
-        # Auto RDS mode (disabled by default, enable with --rds flag)
+        # Auto RDS mode (enabled by default, disable with --no-rds)
         self.auto_mode_enabled = rds_enabled
 
-        # Debug displays (hidden by default)
-        self.show_buffer_stats = False
+        # Debug displays (enabled by default, toggle with '/')
+        self.show_buffer_stats = True
 
         # Spectrum analyzer
         self.spectrum_analyzer = SpectrumAnalyzer(
@@ -1768,12 +1768,15 @@ def build_display(radio, width=80):
         sync_misses = getattr(radio.device, '_sync_misses', 0)
         initial_aligns = getattr(radio.device, '_initial_aligns', 0)
         invalid_24 = getattr(radio.device, '_sync_invalid_24', 0)
+        resyncs = getattr(radio.device, '_sync_resyncs', 0)
         if sync_misses > 0 or initial_aligns > 0 or invalid_24 > 0:
             loss_text.append(f"  sync:{sync_misses}", style="red bold" if sync_misses else "green bold")
             loss_text.append(f"/{initial_aligns}", style="cyan bold")
             loss_text.append(f"/{invalid_24}", style="magenta bold" if invalid_24 else "cyan bold")
         elif radio.use_icom:
             loss_text.append("  sync:0/0/0", style="green bold")
+        if radio.use_icom:
+            loss_text.append(f"  resync:{resyncs}", style="red bold" if resyncs else "green bold")
 
         if radio.use_icom:
             fetch_slow = getattr(radio.device, '_fetch_slow_count', 0)
@@ -2211,8 +2214,16 @@ def main():
     parser.add_argument(
         "--rds",
         action="store_true",
+        dest="rds",
         help="Enable RDS decoding (auto-enables when pilot tone detected)"
     )
+    parser.add_argument(
+        "--no-rds",
+        action="store_false",
+        dest="rds",
+        help="Disable RDS decoding (auto-enables when pilot tone detected)"
+    )
+    parser.set_defaults(rds=True)
 
     args = parser.parse_args()
 

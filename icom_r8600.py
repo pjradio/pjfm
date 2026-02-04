@@ -308,6 +308,7 @@ class IcomR8600:
         self._samples_since_sync = 0  # Counter for sync interval verification
         self._sync_misses = 0  # Counter for missing sync patterns (should stay 0)
         self._sync_short_buf = 0  # Counter for sync checks with insufficient buffer
+        self._sync_resyncs = 0  # Count of successful in-buffer resyncs
         self._flush_during_fetch = 0  # Counter for flush while fetch_iq active
         self._fetch_active = False  # Flag to track if fetch_iq is running
         self._initial_aligns = 0  # Counter for initial alignment attempts
@@ -742,6 +743,28 @@ class IcomR8600:
 
         # Get expected sync interval for this sample rate
         sync_interval = SYNC_INTERVAL.get(self.iq_sample_rate, 1024)
+        expected_gap = sync_interval * sample_size  # bytes between sync patterns
+
+        def _find_resync(start_idx):
+            search_idx = start_idx
+            while True:
+                pos = buf.find(sync_bytes, search_idx)
+                if pos == -1:
+                    return None
+                next_sync_pos = pos + sync_len + expected_gap
+                if next_sync_pos + sync_len <= buf_len and buf[next_sync_pos:next_sync_pos + sync_len] == sync_bytes:
+                    return pos
+                search_idx = pos + 1
+
+        def _handle_sync_miss(search_start):
+            self._sync_misses += 1
+            resync_pos = _find_resync(search_start)
+            if resync_pos is not None:
+                self._sync_resyncs += 1
+                self._samples_since_sync = 0
+                return resync_pos + sync_len
+            self._iq_aligned = False
+            return None
 
         if self._bit_depth == 16:
             # 16-bit parsing: sync intervals are deterministic, so we can use
@@ -781,8 +804,9 @@ class IcomR8600:
                             self._samples_since_sync = 0
                         else:
                             # Unexpected: sync not where expected, re-align
-                            self._sync_misses += 1
-                            self._iq_aligned = False
+                            new_idx = _handle_sync_miss(idx + 1)
+                            if new_idx is not None:
+                                idx = new_idx
 
             # Process complete blocks
             while (parsed_count < num_samples and
@@ -804,8 +828,10 @@ class IcomR8600:
                     self._samples_since_sync = 0
                 else:
                     # Sync not where expected - flag for re-alignment
-                    self._sync_misses += 1
-                    self._iq_aligned = False
+                    new_idx = _handle_sync_miss(idx + 1)
+                    if new_idx is not None:
+                        idx = new_idx
+                        continue
                     break
 
             # Handle partial block at end (not enough data for full block + sync)
@@ -862,8 +888,9 @@ class IcomR8600:
                             self._samples_since_sync = 0
                         else:
                             # Unexpected: sync not where expected, re-align
-                            self._sync_misses += 1
-                            self._iq_aligned = False
+                            new_idx = _handle_sync_miss(idx + 1)
+                            if new_idx is not None:
+                                idx = new_idx
 
             # Process complete blocks
             while (parsed_count < num_samples and
@@ -885,8 +912,10 @@ class IcomR8600:
                     self._samples_since_sync = 0
                 else:
                     # Sync not where expected - flag for re-alignment
-                    self._sync_misses += 1
-                    self._iq_aligned = False
+                    new_idx = _handle_sync_miss(idx + 1)
+                    if new_idx is not None:
+                        idx = new_idx
+                        continue
                     break
 
             # Handle partial block at end (not enough data for full block + sync)
@@ -976,6 +1005,7 @@ class IcomR8600:
         Returns:
             dict with keys:
                 sync_misses: Count of missing sync patterns (should be 0)
+                sync_resyncs: Count of successful in-buffer resyncs
                 sync_invalid_24: Count of 24-bit samples rejected as out of range
                 buffer_overflow_count: Count of buffer overflow trim events
                 total_sample_loss: Total fetch calls that returned fewer samples
@@ -994,6 +1024,7 @@ class IcomR8600:
 
         return {
             'sync_misses': self._sync_misses,
+            'sync_resyncs': self._sync_resyncs,
             'sync_invalid_24': self._sync_invalid_24,
             'buffer_overflow_count': self._buffer_overflow_count,
             'total_sample_loss': self.total_sample_loss,
