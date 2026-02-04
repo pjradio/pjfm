@@ -556,6 +556,9 @@ class FMRadio:
     IQ_SAMPLE_RATE = 250000  # Results in 312.5kHz (40MHz/128) for BB60D, ~480kHz for R8600
     AUDIO_SAMPLE_RATE = 48000
     IQ_BLOCK_SIZE = 8192  # ~26.2ms budget at 312.5kHz
+    IQ_LOSS_MUTE_BLOCKS = 1
+    IQ_LOSS_FLUSH_THRESHOLD = 3
+    IQ_LOSS_FLUSH_COOLDOWN_S = 0.5
 
     # Signal level calibration offset (dB)
     # IQ samples need calibration to match true power in dBm.
@@ -634,6 +637,10 @@ class FMRadio:
         self.error_message = None
         self.signal_dbm = -140.0
         self.is_tuning = False
+        self._last_total_sample_loss = 0
+        self._iq_loss_events = 0
+        self._iq_loss_mute_remaining = 0
+        self._last_iq_flush_time = 0.0
 
         # Frequency presets (1-5), initialized to None
         self.presets = [None, None, None, None, None]
@@ -733,6 +740,10 @@ class FMRadio:
             # Start IQ streaming to get actual sample rate
             self.device.configure_iq_streaming(self.device.frequency, self.IQ_SAMPLE_RATE)
             actual_rate = self.device.iq_sample_rate
+            self._last_total_sample_loss = getattr(self.device, 'total_sample_loss', 0)
+            self._iq_loss_events = 0
+            self._iq_loss_mute_remaining = 0
+            self._last_iq_flush_time = 0.0
 
             # Apply preamp setting if specified (IC-R8600 only)
             #if self._preamp_setting is not None and hasattr(self.device, 'set_preamp'):
@@ -837,6 +848,41 @@ class FMRadio:
                 # Check again after fetch - if tuning started mid-fetch, discard samples
                 if self.is_tuning:
                     continue
+                loss_now = False
+                total_loss = getattr(self.device, 'total_sample_loss', 0)
+                if total_loss < self._last_total_sample_loss:
+                    # Counters reset (e.g., flush) - realign baseline.
+                    self._last_total_sample_loss = total_loss
+                elif total_loss > self._last_total_sample_loss:
+                    self._iq_loss_events += total_loss - self._last_total_sample_loss
+                    self._last_total_sample_loss = total_loss
+                    loss_now = True
+                if len(iq) < self.IQ_BLOCK_SIZE:
+                    loss_now = True
+                if loss_now:
+                    self._iq_loss_mute_remaining = max(
+                        self._iq_loss_mute_remaining,
+                        self.IQ_LOSS_MUTE_BLOCKS,
+                    )
+                    if self.use_icom:
+                        recent_loss = getattr(self.device, 'recent_sample_loss', 0)
+                        now = time.perf_counter()
+                        if (recent_loss >= self.IQ_LOSS_FLUSH_THRESHOLD and
+                                (now - self._last_iq_flush_time) >= self.IQ_LOSS_FLUSH_COOLDOWN_S):
+                            self._last_iq_flush_time = now
+                            self.device.flush_iq()
+                            if self.stereo_decoder:
+                                self.stereo_decoder.reset()
+                            if self.nbfm_decoder:
+                                self.nbfm_decoder.reset()
+                            if self.rds_decoder:
+                                self.rds_decoder.reset()
+                                self.rds_data = {}
+                            self.audio_player.reset()
+                            self._rate_integrator = 0.0
+                            self._filtered_error = 0.0
+                            self._last_total_sample_loss = getattr(self.device, 'total_sample_loss', 0)
+                            continue
 
                 # Measure signal power from IQ data (use subset for speed)
                 # Only measure every 16th sample to reduce overhead
@@ -936,7 +982,11 @@ class FMRadio:
                         self.rds_enabled = False
 
                 # Process RDS inline (no queue) for sample continuity (FM broadcast only)
-                if not self.weather_mode and self.rds_enabled and self.rds_decoder and self.stereo_decoder.last_baseband is not None:
+                if (not loss_now and
+                        not self.weather_mode and
+                        self.rds_enabled and
+                        self.rds_decoder and
+                        self.stereo_decoder.last_baseband is not None):
                     self.rds_data = self.rds_decoder.process(
                         self.stereo_decoder.last_baseband,
                         use_coherent=True  # Use pilot-derived carrier
@@ -945,6 +995,10 @@ class FMRadio:
                 # Apply squelch (mute if signal below threshold)
                 if squelched:
                     audio = np.zeros_like(audio)
+
+                if self._iq_loss_mute_remaining > 0:
+                    audio = np.zeros_like(audio)
+                    self._iq_loss_mute_remaining -= 1
 
                 # Update spectrum analyzer
                 if self.spectrum_enabled:
@@ -1541,13 +1595,6 @@ def build_display(radio, width=80):
         else:
             rds_text.append("OFF", style="dim")
         table.add_row("RDS:", rds_text)
-
-    # Performance stats (disabled - only show sample loss if it occurs)
-    sample_loss = getattr(radio.device, 'total_sample_loss', 0)
-    if sample_loss > 0:
-        perf_text = Text()
-        perf_text.append(f"SAMPLE LOSS: {sample_loss}", style="red bold")
-        table.add_row("Warning:", perf_text)
 
     # Error message if any
     if radio.error_message:
