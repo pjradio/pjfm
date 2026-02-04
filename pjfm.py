@@ -619,12 +619,13 @@ class FMRadio:
         self.rds_enabled = False
         self.rds_data = {}
         self.rds_use_coherent = False
+        self.rds_forced_off = False
 
         # Auto RDS mode (enabled by default, disable with --no-rds)
         self.auto_mode_enabled = rds_enabled
 
-        # Debug displays (enabled by default, toggle with '/')
-        self.show_buffer_stats = True
+        # Debug displays (disabled by default, toggle with '/')
+        self.show_buffer_stats = False
 
         # Spectrum analyzer
         self.spectrum_analyzer = SpectrumAnalyzer(
@@ -674,6 +675,10 @@ class FMRadio:
 
         # Load saved config (presets and last frequency)
         self._load_config()
+        if self.rds_forced_off:
+            self.auto_mode_enabled = False
+            self.rds_enabled = False
+            self.rds_data = {}
 
     def _load_config(self):
         """Load presets and tone settings from config file (frequency is handled by main())."""
@@ -710,6 +715,13 @@ class FMRadio:
                     self.squelch_threshold = float(config.get('radio', 'squelch_threshold'))
                 except ValueError:
                     pass
+
+            # Load RDS force-off toggle
+            if config.has_option('radio', 'rds_force_off'):
+                try:
+                    self.rds_forced_off = config.getboolean('radio', 'rds_force_off')
+                except ValueError:
+                    pass
         except (ValueError, configparser.Error):
             # Ignore invalid config
             pass
@@ -726,6 +738,7 @@ class FMRadio:
             'realtime': str(self.use_realtime).lower(),
             'iq_sample_rate': str(self.iq_sample_rate),
             'squelch_threshold': f'{self.squelch_threshold:.1f}',
+            'rds_force_off': str(self.rds_forced_off).lower(),
         }
 
         # Presets section
@@ -783,7 +796,10 @@ class FMRadio:
             self.stereo_decoder.bass_boost_enabled = self._initial_bass_boost
             self.stereo_decoder.treble_boost_enabled = self._initial_treble_boost
 
-            self.rds_decoder = RDSDecoder(sample_rate=actual_rate)
+            if not self.rds_forced_off:
+                self.rds_decoder = RDSDecoder(sample_rate=actual_rate)
+            else:
+                self.rds_decoder = None
 
             self.nbfm_decoder = NBFMDecoder(
                 iq_sample_rate=actual_rate,
@@ -1054,7 +1070,10 @@ class FMRadio:
                 # Auto mode: RDS is enabled when pilot is present (FM broadcast only)
                 # (pilot = station has stereo/RDS capability)
                 # Don't enable RDS on noise - require signal above squelch threshold
-                if not self.weather_mode and self.auto_mode_enabled and self.stereo_decoder:
+                if (not self.weather_mode and
+                        not self.rds_forced_off and
+                        self.auto_mode_enabled and
+                        self.stereo_decoder):
                     snr_ok = self.stereo_decoder.snr_db >= self.stereo_decoder.stereo_blend_low
                     pilot_present = (self.stereo_decoder.pilot_detected and
                                      dbm >= self.squelch_threshold and
@@ -1070,6 +1089,7 @@ class FMRadio:
                 # Process RDS inline (no queue) for sample continuity (FM broadcast only)
                 if (not loss_now and
                         not self.weather_mode and
+                        not self.rds_forced_off and
                         self.rds_enabled and
                         self.rds_decoder and
                         self.stereo_decoder.last_baseband is not None):
@@ -1232,6 +1252,8 @@ class FMRadio:
 
     def toggle_rds(self):
         """Toggle RDS decoding on/off."""
+        if self.rds_forced_off:
+            return
         self.rds_enabled = not self.rds_enabled
         if self.rds_decoder:
             self.rds_decoder.reset()
@@ -1596,8 +1618,8 @@ def build_display(radio, width=80):
         stereo_text.append(" (no pilot)", style="dim")
     table.add_row("Audio:", stereo_text)
 
-    # RDS data display (FM mode only - hidden in weather mode)
-    if not radio.weather_mode:
+    # RDS data display (FM mode only - hidden in weather mode or when forced off)
+    if not radio.weather_mode and not radio.rds_forced_off:
         rds_snapshot = dict(radio.rds_data) if radio.rds_data else {}
         ps_name = rds_snapshot.get('station_name', '') if radio.rds_enabled else ''
         pty = rds_snapshot.get('program_type', '') if radio.rds_enabled else ''
@@ -1667,16 +1689,16 @@ def build_display(radio, width=80):
     table.add_row("Boost:", tone_text)
 
     # RDS status (FM mode only)
-    if not radio.weather_mode:
+    if not radio.weather_mode and not radio.rds_forced_off:
         rds_text = Text()
         if radio.rds_enabled:
             rds_text.append("ON", style="green bold")
-            if rds_snapshot.get('synced'):
-                rds_text.append("  [SYNC]", style="green")
-            else:
-                rds_text.append("  [SRCH]", style="yellow")
             # Show detailed stats only in debug mode
             if radio.show_buffer_stats:
+                if rds_snapshot.get('synced'):
+                    rds_text.append("  [SYNC]", style="green")
+                else:
+                    rds_text.append("  [SRCH]", style="yellow")
                 groups = rds_snapshot.get('groups_received', 0)
                 block_rate = rds_snapshot.get('block_rate', 0)
                 corrected = rds_snapshot.get('blocks_corrected', 0)
@@ -1688,7 +1710,12 @@ def build_display(radio, width=80):
                 # For small offsets: delta_Hz ≈ -freq_offset * symbol_rate^2 / sample_rate
                 sample_rate = rds_snapshot.get('sample_rate', 250000)
                 delta_hz = -freq_offset * (1187.5 ** 2) / sample_rate
-                rds_text.append(f"  grp:{groups} blk:{block_rate:.0%} cor:{corrected} sig:{sig_level:.3f} tau:{timing_range[0]:.2f}/{timing_range[1]:.2f} df:{delta_hz:+.2f}Hz", style="dim")
+                rds_text.append(
+                    f"  grp:{groups} blk:{block_rate:.0%} cor:{corrected} "
+                    f"sig:{sig_level:.3f} tau:{timing_range[0]:.2f}/{timing_range[1]:.2f} "
+                    f"df:{delta_hz:+.2f}Hz",
+                    style="dim"
+                )
         else:
             rds_text.append("OFF", style="dim")
         table.add_row("RDS:", rds_text)
@@ -1826,8 +1853,11 @@ def build_display(radio, width=80):
         table.add_row("IQ Loss:", loss_text)
 
         # RDS coherent demod diagnostics (when enabled)
-        if not radio.weather_mode and radio.rds_decoder and radio.rds_decoder._diag_enabled:
-            rds_diag = Text()
+    if (not radio.weather_mode and
+            not radio.rds_forced_off and
+            radio.rds_decoder and
+            radio.rds_decoder._diag_enabled):
+        rds_diag = Text()
             pilot_rms = rds_snapshot.get('pilot_rms', 0)
             carrier_rms = rds_snapshot.get('carrier_rms', 0)
             bb_rms = rds_snapshot.get('baseband_rms', 0)
