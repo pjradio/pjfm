@@ -314,6 +314,7 @@ class IcomR8600:
         self._initial_aligns = 0  # Counter for initial alignment attempts
         self._sync_invalid_24 = 0  # Counter for 24-bit samples rejected as invalid
         self._fetch_last_ms = 0.0  # Last fetch_iq duration in ms
+        self._fetch_slowest_ms = 0.0  # Slowest fetch_iq duration in ms
         self._fetch_slow_count = 0  # Count of slow fetch_iq calls
         self._fetch_slow_threshold_ms = 50.0  # Minimum slow fetch threshold in ms
         self._fetch_slow_multiplier = 2.0  # Slow threshold = max(min_threshold, expected_ms * multiplier)
@@ -630,7 +631,7 @@ class IcomR8600:
 
         return i, q
 
-    def fetch_iq(self, num_samples=8192):
+    def fetch_iq(self, num_samples=8192, abort_check=None):
         """
         Fetch IQ samples for software demodulation.
 
@@ -648,6 +649,13 @@ class IcomR8600:
 
         start_time = time.perf_counter()
         self._fetch_active = True
+        if abort_check is not None and abort_check():
+            duration_ms = (time.perf_counter() - start_time) * 1000.0
+            self._fetch_last_ms = duration_ms
+            if duration_ms > self._fetch_slowest_ms:
+                self._fetch_slowest_ms = duration_ms
+            self._fetch_active = False
+            return np.zeros(num_samples, dtype=np.complex64)
 
         # Define sync pattern and sample parameters based on bit depth
         # Per Icom I/Q Reference Guide:
@@ -668,6 +676,13 @@ class IcomR8600:
         # Collect raw bytes from USB reader thread
         timeout = time.time() + 1.0
         while len(self._iq_byte_buf) < bytes_needed and time.time() < timeout:
+            if abort_check is not None and abort_check():
+                duration_ms = (time.perf_counter() - start_time) * 1000.0
+                self._fetch_last_ms = duration_ms
+                if duration_ms > self._fetch_slowest_ms:
+                    self._fetch_slowest_ms = duration_ms
+                self._fetch_active = False
+                return np.zeros(num_samples, dtype=np.complex64)
             with self._iq_lock:
                 while self._iq_buffer:
                     self._iq_byte_buf += self._iq_buffer.pop(0)
@@ -682,6 +697,13 @@ class IcomR8600:
             search_start = 0
 
             while time.time() < timeout:
+                if abort_check is not None and abort_check():
+                    duration_ms = (time.perf_counter() - start_time) * 1000.0
+                    self._fetch_last_ms = duration_ms
+                    if duration_ms > self._fetch_slowest_ms:
+                        self._fetch_slowest_ms = duration_ms
+                    self._fetch_active = False
+                    return np.zeros(num_samples, dtype=np.complex64)
                 # Collect more data if needed
                 with self._iq_lock:
                     while self._iq_buffer:
@@ -730,6 +752,13 @@ class IcomR8600:
             # Reset timeout to give post-alignment collection a fresh window
             timeout = time.time() + 1.0
             while len(self._iq_byte_buf) < bytes_needed and time.time() < timeout:
+                if abort_check is not None and abort_check():
+                    duration_ms = (time.perf_counter() - start_time) * 1000.0
+                    self._fetch_last_ms = duration_ms
+                    if duration_ms > self._fetch_slowest_ms:
+                        self._fetch_slowest_ms = duration_ms
+                    self._fetch_active = False
+                    return np.zeros(num_samples, dtype=np.complex64)
                 with self._iq_lock:
                     while self._iq_buffer:
                         self._iq_byte_buf += self._iq_buffer.pop(0)
@@ -980,6 +1009,8 @@ class IcomR8600:
 
         duration_ms = (time.perf_counter() - start_time) * 1000.0
         self._fetch_last_ms = duration_ms
+        if duration_ms > self._fetch_slowest_ms:
+            self._fetch_slowest_ms = duration_ms
         slow_threshold_ms = self._fetch_slow_threshold_ms
         if self.iq_sample_rate:
             expected_ms = num_samples / float(self.iq_sample_rate) * 1000.0

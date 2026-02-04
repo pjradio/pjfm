@@ -255,7 +255,7 @@ class BB60D:
 
     # fetch_audio() removed - using software FM demodulation instead
 
-    def fetch_iq(self, num_samples=8192):
+    def fetch_iq(self, num_samples=8192, abort_check=None):
         """
         Fetch IQ samples for software demodulation.
 
@@ -267,6 +267,8 @@ class BB60D:
         """
         if self.streaming_mode != "iq":
             raise RuntimeError("Device not in IQ streaming mode")
+        if abort_check is not None and abort_check():
+            return np.zeros(num_samples, dtype=np.complex64)
 
         iq_data = np.zeros(num_samples, dtype=np.complex64)
         data_remaining = c_int(0)

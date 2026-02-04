@@ -821,6 +821,9 @@ class FMRadio:
             self._iq_queue.clear()
             self._iq_cond.notify_all()
 
+    def _should_abort_iq_fetch(self):
+        return self.is_tuning or not self._iq_running
+
     def _get_iq_block(self):
         with self._iq_cond:
             if not self._iq_queue:
@@ -836,11 +839,13 @@ class FMRadio:
                 if self.is_tuning:
                     time.sleep(0.01)
                     continue
-                iq = self.device.fetch_iq(self.IQ_BLOCK_SIZE)
+                iq = self.device.fetch_iq(self.IQ_BLOCK_SIZE, abort_check=self._should_abort_iq_fetch)
             except Exception as exc:
                 if not self.is_tuning:
                     self.error_message = str(exc)
                 time.sleep(0.01)
+                continue
+            if self.is_tuning:
                 continue
 
             with self._iq_cond:
@@ -1784,11 +1789,12 @@ def build_display(radio, width=80):
         if radio.use_icom:
             fetch_slow = getattr(radio.device, '_fetch_slow_count', 0)
             fetch_last_ms = getattr(radio.device, '_fetch_last_ms', 0.0)
+            fetch_slowest_ms = getattr(radio.device, '_fetch_slowest_ms', 0.0)
             fetch_thresh = getattr(radio.device, '_fetch_slow_threshold_ms', 0.0)
             civ_timeouts = getattr(radio.device, '_civ_timeouts', 0)
             loss_text.append(f"  fetch:{fetch_slow}", style="red bold" if fetch_slow else "green bold")
             fetch_style = "red bold" if fetch_thresh and fetch_last_ms > fetch_thresh else "cyan bold"
-            loss_text.append(f"/{fetch_last_ms:<2.0f}ms", style=fetch_style)
+            loss_text.append(f"/{fetch_last_ms:<2.0f}/{fetch_slowest_ms:.0f}ms", style=fetch_style)
             loss_text.append(f"  civ:{civ_timeouts}", style="red bold" if civ_timeouts else "green bold")
         queue_drops = getattr(radio, '_iq_queue_drops', 0)
         queue_len = 0
