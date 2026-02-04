@@ -1595,27 +1595,19 @@ def build_display(radio, width=80):
         band_text.append("108", style="yellow")
     table.add_row("Band:", band_text)
 
-    # Stereo status (stereo decoder always active, shows pilot detection status)
+    # Stereo status (simplified: Mono, Stereo, Stereo (blend))
     table.add_row("", "")  # Spacer
     stereo_text = Text()
     if radio.weather_mode:
         stereo_text.append("Mono", style="cyan bold")
-        stereo_text.append(" (NBFM)", style="dim")
-    elif radio.pilot_detected:
+    else:
         blend = radio.stereo_blend_factor
         if blend >= 0.99:
             stereo_text.append("Stereo", style="green bold")
-            stereo_text.append(" (19 kHz pilot detected)", style="green")
         elif blend <= 0.01:
             stereo_text.append("Mono", style="yellow")
-            stereo_text.append(" (blended - low SNR)", style="yellow")
         else:
-            blend_pct = int(blend * 100)
-            stereo_text.append(f"Blend {blend_pct}%", style="yellow bold")
-            stereo_text.append(" (reduced stereo for noise)", style="yellow")
-    else:
-        stereo_text.append("Mono", style="yellow")
-        stereo_text.append(" (no pilot)", style="dim")
+            stereo_text.append("Stereo (blend)", style="yellow bold")
     table.add_row("Audio:", stereo_text)
 
     # RDS data display (FM mode only - hidden in weather mode or when forced off)
@@ -1853,11 +1845,11 @@ def build_display(radio, width=80):
         table.add_row("IQ Loss:", loss_text)
 
         # RDS coherent demod diagnostics (when enabled)
-    if (not radio.weather_mode and
-            not radio.rds_forced_off and
-            radio.rds_decoder and
-            radio.rds_decoder._diag_enabled):
-        rds_diag = Text()
+        if (not radio.weather_mode and
+                not radio.rds_forced_off and
+                radio.rds_decoder and
+                radio.rds_decoder._diag_enabled):
+            rds_diag = Text()
             pilot_rms = rds_snapshot.get('pilot_rms', 0)
             carrier_rms = rds_snapshot.get('carrier_rms', 0)
             bb_rms = rds_snapshot.get('baseband_rms', 0)
