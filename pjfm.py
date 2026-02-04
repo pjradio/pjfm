@@ -554,7 +554,7 @@ class FMRadio:
     """
 
     # IQ streaming parameters
-    IQ_SAMPLE_RATE = 250000  # Results in 312.5kHz (40MHz/128) for BB60D, ~480kHz for R8600
+    IQ_SAMPLE_RATE = 240000  # Requested IQ sample rate (Hz); actual rate depends on device
     AUDIO_SAMPLE_RATE = 48000
     IQ_BLOCK_SIZE = 8192  # ~26.2ms budget at 312.5kHz
     IQ_QUEUE_MAX_BLOCKS = 8
@@ -574,7 +574,7 @@ class FMRadio:
     CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'pjfm.cfg')
 
     def __init__(self, initial_freq=89.9e6, use_icom=False, use_24bit=False, preamp=None,
-                 rds_enabled=True, realtime=True):
+                 rds_enabled=True, realtime=True, iq_sample_rate=None):
         """
         Initialize FM Radio.
 
@@ -585,6 +585,7 @@ class FMRadio:
             realtime: If True, real-time scheduling was requested (for config save)
             use_24bit: If True, use 24-bit I/Q samples (IC-R8600 only)
             preamp: None (don't touch), True (force on), or False (force off)
+            iq_sample_rate: Requested IQ sample rate in Hz (optional)
         """
         self.use_icom = use_icom
         self.use_24bit = use_24bit
@@ -601,6 +602,7 @@ class FMRadio:
             self.device = BB60D()
 
         self.device.frequency = initial_freq
+        self.iq_sample_rate = int(iq_sample_rate) if iq_sample_rate else self.IQ_SAMPLE_RATE
 
         # Audio player at 48 kHz with stereo support
         self.audio_player = AudioPlayer(
@@ -713,7 +715,8 @@ class FMRadio:
             'last_frequency': f'{self.device.frequency / 1e6:.1f}',
             'device': 'icom' if self.use_icom else 'bb60d',
             'use_24bit': str(self.use_24bit).lower(),
-            'realtime': str(self.use_realtime).lower()
+            'realtime': str(self.use_realtime).lower(),
+            'iq_sample_rate': str(self.iq_sample_rate)
         }
 
         # Presets section
@@ -748,7 +751,7 @@ class FMRadio:
             self.device.open()
 
             # Start IQ streaming to get actual sample rate
-            self.device.configure_iq_streaming(self.device.frequency, self.IQ_SAMPLE_RATE)
+            self.device.configure_iq_streaming(self.device.frequency, self.iq_sample_rate)
             actual_rate = self.device.iq_sample_rate
             self._last_total_sample_loss = getattr(self.device, 'total_sample_loss', 0)
             self._iq_loss_events = 0
@@ -2212,6 +2215,12 @@ def main():
         help="Force preamp on or off (IC-R8600 only, default: unchanged)"
     )
     parser.add_argument(
+        "--iq-rate",
+        type=int,
+        default=None,
+        help="Requested IQ sample rate in Hz (default: config or 240000)"
+    )
+    parser.add_argument(
         "--rds",
         action="store_true",
         dest="rds",
@@ -2255,6 +2264,7 @@ def main():
     use_icom = False  # Default device
     use_24bit = False  # Default 16-bit I/Q
     use_realtime = True  # Default to real-time scheduling enabled
+    iq_sample_rate = None
     config_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'pjfm.cfg')
     if os.path.exists(config_path):
         config = configparser.ConfigParser()
@@ -2271,6 +2281,11 @@ def main():
                 use_24bit = config.getboolean('radio', 'use_24bit')
             if config.has_option('radio', 'realtime'):
                 use_realtime = config.getboolean('radio', 'realtime')
+            if config.has_option('radio', 'iq_sample_rate'):
+                try:
+                    iq_sample_rate = int(config.get('radio', 'iq_sample_rate'))
+                except ValueError:
+                    iq_sample_rate = None
         except (ValueError, configparser.Error):
             pass
 
@@ -2323,9 +2338,17 @@ def main():
     elif args.preamp == "off":
         preamp_setting = False
 
+    # Command-line IQ rate overrides config
+    if args.iq_rate is not None:
+        if args.iq_rate <= 0:
+            print("Error: --iq-rate must be a positive integer (Hz)")
+            sys.exit(1)
+        iq_sample_rate = args.iq_rate
+
     # Create radio instance
     radio = FMRadio(initial_freq=initial_freq, use_icom=use_icom, use_24bit=use_24bit,
-                    preamp=preamp_setting, rds_enabled=args.rds, realtime=use_realtime)
+                    preamp=preamp_setting, rds_enabled=args.rds, realtime=use_realtime,
+                    iq_sample_rate=iq_sample_rate)
     radio.rt_enabled = rt_enabled
 
     # Check for headless mode (for automated PI loop tuning)
