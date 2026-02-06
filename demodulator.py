@@ -117,10 +117,10 @@ class FMStereoDecoder:
         # Must be:
         # - Above FM multiplex (stereo 38 kHz, RDS 57 kHz, HD sidebands ~75 kHz)
         # - Below 0.8 of Nyquist for good filter performance at all sample rates
-        # At 480 kHz (R8600): 80-120 kHz is 0.33-0.50 of Nyquist (240 kHz) - good
-        # At 312.5 kHz (BB60D): 80-120 kHz is 0.51-0.77 of Nyquist (156.25 kHz) - good
-        noise_low_hz = 80000
-        noise_high_hz = 120000
+        # At 480 kHz (R8600): 100-110 kHz is 0.42-0.46 of Nyquist (240 kHz) - good
+        # Narrower band avoids residual energy from stereo/RDS harmonics below 100 kHz
+        noise_low_hz = 90000
+        noise_high_hz = 100000
         noise_low = noise_low_hz / nyq
         noise_high = min(noise_high_hz / nyq, 0.90)
         if noise_high > noise_low and noise_low < 0.90:
