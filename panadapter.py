@@ -404,6 +404,9 @@ class WBFMStereoDemodulator:
             deviation=WBFM_DEVIATION,
             deemphasis=WBFM_DEEMPHASIS
         )
+        # Disable tone boosts by default (no UI switches wired yet)
+        self.stereo_decoder.bass_boost_enabled = False
+        self.stereo_decoder.treble_boost_enabled = False
 
         # State for frequency shifting
         self.shift_phase = 0.0
@@ -516,6 +519,10 @@ class AudioOutput:
         self.read_pos = 0
         self.buffer_lock = threading.Lock()
 
+        # Buffer health counters
+        self.drop_count = 0       # Total audio samples dropped (buffer full)
+        self.underrun_count = 0   # Total underrun events (buffer empty during callback)
+
     def set_gain(self, gain):
         """Set the audio gain (0.0 = mute, 1.0 = normal, 2.0 = +6dB)."""
         self.gain = max(0.0, min(2.0, gain))
@@ -538,6 +545,8 @@ class AudioOutput:
             self.buffer[:] = 0
             self.write_pos = prefill
             self.read_pos = 0
+        self.drop_count = 0
+        self.underrun_count = 0
 
     def start(self):
         """Start audio output stream."""
@@ -580,6 +589,7 @@ class AudioOutput:
             space = buffer_len - ((self.write_pos - self.read_pos) % buffer_len) - 1
 
             if samples > space:
+                self.drop_count += samples - space
                 samples = space  # Drop samples if buffer full
 
             if samples > 0:
@@ -620,6 +630,7 @@ class AudioOutput:
                     outdata[:] = np.clip(data, -1.0, 1.0)
             else:
                 # Buffer underrun - output what we have plus silence
+                self.underrun_count += 1
                 if available > 0:
                     end_pos = self.read_pos + available
                     if end_pos <= buffer_len:
@@ -637,6 +648,23 @@ class AudioOutput:
                     else:
                         outdata[:available] = np.clip(data, -1.0, 1.0)
                 outdata[available:] = 0
+
+    def get_buffer_depth(self):
+        """Return (available_samples, buffer_length)."""
+        with self.buffer_lock:
+            buffer_len = len(self.buffer)
+            available = (self.write_pos - self.read_pos) % buffer_len
+            return available, buffer_len
+
+    def get_stats(self):
+        """Return buffer health stats dict."""
+        available, buffer_len = self.get_buffer_depth()
+        pct = (available / buffer_len * 100) if buffer_len > 0 else 0
+        return {
+            'drop_count': self.drop_count,
+            'underrun_count': self.underrun_count,
+            'buffer_pct': pct,
+        }
 
 
 class DataThread(QThread):
@@ -1206,6 +1234,57 @@ class PeakMeterWidget(QFrame):
             self.limiter_label.setText('')
 
 
+class BufferStatsWidget(QFrame):
+    """Compact widget showing IQ and audio buffer health stats."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setFrameStyle(QFrame.StyledPanel | QFrame.Sunken)
+        self.setFixedHeight(42)
+        self.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
+
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(8, 4, 8, 4)
+
+        self.stats_label = QLabel('IQ: -- | Aud: --% | D:0 U:0')
+        self.stats_label.setStyleSheet('font-family: "Menlo", monospace; font-size: 11px;')
+        layout.addWidget(self.stats_label)
+
+    def update_stats(self, iq_stats, audio_stats):
+        """Update display with current stats.
+
+        Args:
+            iq_stats: dict from device.get_diagnostics() or None for BB60D
+            audio_stats: dict from AudioOutput.get_stats() or None
+        """
+        # IQ buffer
+        if iq_stats and 'usb_buffer_kb' in iq_stats:
+            iq_text = f'IQ: {iq_stats["usb_buffer_kb"]:.1f}KB'
+        else:
+            iq_text = 'IQ: --'
+
+        # Audio buffer
+        if audio_stats:
+            aud_pct = audio_stats.get('buffer_pct', 0)
+            drops = audio_stats.get('drop_count', 0)
+            underruns = audio_stats.get('underrun_count', 0)
+        else:
+            aud_pct = 0
+            drops = 0
+            underruns = 0
+
+        aud_text = f'Aud: {aud_pct:.0f}%'
+
+        d_color = ' style="color: #ff4444;"' if drops > 0 else ''
+        u_color = ' style="color: #ff4444;"' if underruns > 0 else ''
+        d_text = f'<span{d_color}>D:{drops}</span>'
+        u_text = f'<span{u_color}>U:{underruns}</span>'
+
+        self.stats_label.setText(
+            f'{iq_text} | {aud_text} | {d_text} {u_text}'
+        )
+
+
 class MainWindow(QMainWindow):
     """Main application window with spectrum and waterfall displays."""
 
@@ -1454,6 +1533,10 @@ class MainWindow(QMainWindow):
         # Peak meter bar
         self.peak_meter = PeakMeterWidget()
         meter_layout.addWidget(self.peak_meter)
+
+        # Buffer stats
+        self.buffer_stats = BufferStatsWidget()
+        meter_layout.addWidget(self.buffer_stats)
 
         # Throttle meter updates to 15 Hz
         self._meter_interval = 1.0 / 15
@@ -1746,6 +1829,9 @@ class MainWindow(QMainWindow):
         if self.current_mode == self.MODE_FM_BROADCAST:
             self._update_stereo_indicators()
 
+        # Update buffer stats
+        self._update_buffer_stats()
+
     def _update_stereo_indicators(self):
         """Update stereo and SNR indicators from WBFM stereo demodulator."""
         if not hasattr(self, 'wbfm_demodulator') or self.wbfm_demodulator is None:
@@ -1778,6 +1864,18 @@ class MainWindow(QMainWindow):
         # Get peak amplitude from the active demodulator
         peak = self.demodulator.peak_amplitude
         self.peak_meter.set_level(peak)
+
+    def _update_buffer_stats(self):
+        """Update buffer stats widget with IQ and audio buffer health."""
+        audio_stats = None
+        if hasattr(self, 'audio_output') and self.audio_output:
+            audio_stats = self.audio_output.get_stats()
+
+        iq_stats = None
+        if hasattr(self, 'device') and self.device and hasattr(self.device, 'get_diagnostics'):
+            iq_stats = self.device.get_diagnostics()
+
+        self.buffer_stats.update_stats(iq_stats, audio_stats)
 
     def tune(self, delta):
         """Change frequency by delta Hz."""
