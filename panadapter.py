@@ -1455,6 +1455,10 @@ class MainWindow(QMainWindow):
         self.peak_meter = PeakMeterWidget()
         meter_layout.addWidget(self.peak_meter)
 
+        # Throttle meter updates to 15 Hz
+        self._meter_interval = 1.0 / 15
+        self._last_meter_update = 0.0
+
         meter_layout.addStretch()
         main_layout.addWidget(meter_frame)
 
@@ -1710,8 +1714,11 @@ class MainWindow(QMainWindow):
         self.spectrum_widget.update_spectrum(self.spectrum_avg)
         self.waterfall_widget.update_waterfall(self.spectrum_avg)
 
-        # Update S-meter with signal level at tuned frequency
-        self._update_smeter(self.spectrum_avg)
+        # Update S-meter and peak meter (throttled to 5 Hz)
+        now = time.monotonic()
+        if now - self._last_meter_update >= self._meter_interval:
+            self._last_meter_update = now
+            self._update_smeter(self.spectrum_avg)
 
     def _update_smeter(self, spectrum_db):
         """Update S-meter with signal level at the tuned frequency."""
@@ -1826,7 +1833,16 @@ class MainWindow(QMainWindow):
         """Handle frequency entry from text field."""
         try:
             freq_mhz = float(self.freq_entry.text())
-            self.set_frequency(freq_mhz * 1e6)
+            freq_hz = freq_mhz * 1e6
+            self.set_frequency(freq_hz)
+            # Center the tuned frequency (red line) on the new center
+            self.tuned_freq = freq_hz
+            self.spectrum_widget.set_tuned_freq(freq_hz)
+            self.waterfall_widget.set_tuned_freq(freq_hz)
+            self.tuned_freq_label.setText(f'{freq_hz/1e6:.4f} MHz')
+            if self.demodulator:
+                self.demodulator.set_tuned_offset(0)
+                self.demodulator.reset()
         except ValueError:
             pass
 
