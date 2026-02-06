@@ -226,10 +226,32 @@ class NBFMDemodulator:
         # Peak amplitude tracking
         self._peak_amplitude = 0.0
 
+        # Adaptive rate control
+        self._rate_adjust = 1.0
+
     @property
     def peak_amplitude(self):
         """Returns peak amplitude (before clipping)."""
         return self._peak_amplitude
+
+    @property
+    def rate_adjust(self):
+        return self._rate_adjust
+
+    @rate_adjust.setter
+    def rate_adjust(self, value):
+        self._rate_adjust = max(0.98, min(1.02, value))
+
+    def nominal_resample_bias_ppm(self, input_block_len):
+        """Estimate deterministic output-rate bias from integer sample rounding."""
+        if input_block_len <= 0:
+            return 0.0
+
+        decimated_len = (input_block_len + self.decimation - 1) // self.decimation
+        nominal_output = int(decimated_len * self.resample_ratio)
+        produced_rate = nominal_output * (self.input_sample_rate / input_block_len)
+
+        return (produced_rate / self.audio_sample_rate - 1.0) * 1e6
 
     def set_tuned_offset(self, offset_hz):
         """Set the tuning offset from center frequency."""
@@ -336,8 +358,9 @@ class NBFMDemodulator:
                 audio_filtered, zi=self.hum_filter_state
             )
 
-        # Resample to output audio rate
-        num_output_samples = int(len(audio_filtered) * self.resample_ratio)
+        # Resample to output audio rate (with adaptive rate control)
+        nominal_output = int(len(audio_filtered) * self.resample_ratio)
+        num_output_samples = int(round(nominal_output * self._rate_adjust))
         if num_output_samples > 0:
             audio_resampled = signal.resample(audio_filtered, num_output_samples)
             # Scale audio
@@ -438,6 +461,29 @@ class WBFMStereoDemodulator:
     def peak_amplitude(self):
         """Returns peak amplitude (before limiting). >0.8 means limiter active."""
         return self.stereo_decoder.peak_amplitude
+
+    @property
+    def rate_adjust(self):
+        return self.stereo_decoder.rate_adjust
+
+    @rate_adjust.setter
+    def rate_adjust(self, value):
+        self.stereo_decoder.rate_adjust = value
+
+    def nominal_resample_bias_ppm(self, input_block_len):
+        """Estimate deterministic output-rate bias from integer sample rounding."""
+        if input_block_len <= 0:
+            return 0.0
+
+        if self.decimation > 1:
+            decimated_len = (input_block_len + self.decimation - 1) // self.decimation
+        else:
+            decimated_len = input_block_len
+
+        nominal_output = int(round(decimated_len * self.stereo_decoder._nominal_ratio))
+        produced_rate = nominal_output * (self.input_sample_rate / input_block_len)
+
+        return (produced_rate / self.audio_sample_rate - 1.0) * 1e6
 
     def process(self, iq_data):
         """
@@ -1246,16 +1292,18 @@ class BufferStatsWidget(QFrame):
         layout = QHBoxLayout(self)
         layout.setContentsMargins(8, 4, 8, 4)
 
-        self.stats_label = QLabel('IQ: -- | Aud: --% | D:0 U:0')
+        self.stats_label = QLabel('IQ: -- | Aud: --% | D:0 U:0 | Adj:+0ppm | Drift:+0ppm')
         self.stats_label.setStyleSheet('font-family: "Menlo", monospace; font-size: 11px;')
         layout.addWidget(self.stats_label)
 
-    def update_stats(self, iq_stats, audio_stats):
+    def update_stats(self, iq_stats, audio_stats, rate_ppm=0.0, abs_drift_ppm=0.0):
         """Update display with current stats.
 
         Args:
             iq_stats: dict from device.get_diagnostics() or None for BB60D
             audio_stats: dict from AudioOutput.get_stats() or None
+            rate_ppm: PI controller output in ppm (resample command)
+            abs_drift_ppm: estimated source clock drift in ppm (bias-corrected)
         """
         # IQ buffer
         if iq_stats and 'usb_buffer_kb' in iq_stats:
@@ -1280,8 +1328,11 @@ class BufferStatsWidget(QFrame):
         d_text = f'<span{d_color}>D:{drops}</span>'
         u_text = f'<span{u_color}>U:{underruns}</span>'
 
+        rate_text = f'Adj:{rate_ppm:+.0f}ppm'
+        drift_text = f'Drift:{abs_drift_ppm:+.0f}ppm'
+
         self.stats_label.setText(
-            f'{iq_text} | {aud_text} | {d_text} {u_text}'
+            f'{iq_text} | {aud_text} | {d_text} {u_text} | {rate_text} | {drift_text}'
         )
 
 
@@ -1330,6 +1381,28 @@ class MainWindow(QMainWindow):
         self.demodulator = None  # Currently active demodulator
         self.audio_output = None
         self.tuned_freq = center_freq  # Currently tuned frequency for demod
+
+        # PI rate controller for audio clock drift compensation.
+        # Qt event loop batches audio_ready signals into bursts every ~100ms.
+        # PI fires once per burst via 60Hz throttle (burst rate ~10Hz < 60Hz).
+        # P-dominant design: large Kp for fast initial correction, tiny Ki
+        # for slow fine-tuning to eliminate steady-state error.
+        # Heavy EMA (alpha=0.005) filters ±15ms burst-jitter noise.
+        # Validated via simulation (pi_tuner_panadapter.py) across ±1000 ppm.
+        self._rate_Kp = 0.00005       # 50 ppm/ms — proportional gain
+        self._rate_Ki = 0.00000002    # 0.02 ppm/ms — integral gain (slow)
+        # Seed integrator with known ~1200 ppm bias from integer rounding
+        # (audio callback delivers 410 samples/block vs theoretical 409.6).
+        # Since _rate_adj = 1.0 - (p_term + integrator), a positive integrator
+        # produces a negative ppm correction. This lets the PI controller start
+        # near steady-state instead of spending ~20s converging from zero.
+        self._rate_integrator = 0.0012     # → _rate_adj ≈ 0.9988 (-1200 ppm)
+        self._rate_integrator_max = 0.002  # ±2000 ppm max
+        self._error_filter_alpha = 0.005   # EMA — ~20s time constant at 10Hz burst rate
+        self._filtered_error = 0.0
+        self._rate_adj = 1.0 - self._rate_integrator  # Start at seeded value
+        self._pi_interval = 1.0 / 60  # Throttle: fires once per burst (~10Hz)
+        self._pi_last_update = 0.0
 
         self.setup_ui()
         self.apply_initial_mode()  # Configure UI for initial mode
@@ -1865,6 +1938,22 @@ class MainWindow(QMainWindow):
         peak = self.demodulator.peak_amplitude
         self.peak_meter.set_level(peak)
 
+    def _estimate_abs_drift_ppm(self, rate_ppm):
+        """Estimate true clock drift by removing deterministic rounding bias."""
+        if not self.demodulator or not self.data_thread:
+            return 0.0
+        if not hasattr(self.demodulator, 'nominal_resample_bias_ppm'):
+            return 0.0
+
+        block_len = getattr(self.data_thread, 'samples_per_block', 0)
+        if block_len <= 0:
+            return 0.0
+
+        bias_ppm = self.demodulator.nominal_resample_bias_ppm(block_len)
+        # PI command compensates both true drift and integer-rounding bias:
+        # rate_ppm ~= -(drift_ppm + bias_ppm).
+        return -rate_ppm - bias_ppm
+
     def _update_buffer_stats(self):
         """Update buffer stats widget with IQ and audio buffer health."""
         audio_stats = None
@@ -1875,7 +1964,9 @@ class MainWindow(QMainWindow):
         if hasattr(self, 'device') and self.device and hasattr(self.device, 'get_diagnostics'):
             iq_stats = self.device.get_diagnostics()
 
-        self.buffer_stats.update_stats(iq_stats, audio_stats)
+        rate_ppm = (self._rate_adj - 1.0) * 1e6
+        abs_drift_ppm = self._estimate_abs_drift_ppm(rate_ppm)
+        self.buffer_stats.update_stats(iq_stats, audio_stats, rate_ppm, abs_drift_ppm)
 
     def tune(self, delta):
         """Change frequency by delta Hz."""
@@ -2116,6 +2207,33 @@ class MainWindow(QMainWindow):
         """Handle demodulated audio from data thread."""
         if self.audio_output:
             self.audio_output.write(audio_samples)
+
+            # PI rate controller — throttled so it fires once per burst (~10Hz)
+            now = time.monotonic()
+            if now - self._pi_last_update < self._pi_interval:
+                return
+            self._pi_last_update = now
+
+            # Measure buffer level in ms
+            available, buf_len = self.audio_output.get_buffer_depth()
+            buf_ms = available / self.audio_output.sample_rate * 1000
+            target_ms = self.audio_output.latency * 1000
+            buf_error = buf_ms - target_ms  # positive = too full
+
+            # EMA filter to smooth burst-jitter noise
+            self._filtered_error = (self._error_filter_alpha * buf_error +
+                                    (1.0 - self._error_filter_alpha) * self._filtered_error)
+
+            # PI computation
+            p_term = self._filtered_error * self._rate_Kp
+            self._rate_integrator += self._filtered_error * self._rate_Ki
+            self._rate_integrator = max(-self._rate_integrator_max,
+                                        min(self._rate_integrator_max, self._rate_integrator))
+            self._rate_adj = 1.0 - (p_term + self._rate_integrator)
+            self._rate_adj = max(0.98, min(1.02, self._rate_adj))
+
+            if self.demodulator and hasattr(self.demodulator, 'rate_adjust'):
+                self.demodulator.rate_adjust = self._rate_adj
 
     def on_squelch_status(self, is_open):
         """Handle squelch status change."""
