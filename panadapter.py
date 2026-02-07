@@ -46,6 +46,7 @@ except (ImportError, RuntimeError):
     BB_MAX_FREQ = 6.4e9
 
 from demodulator import FMStereoDecoder
+from rds_decoder import RDSDecoder, pi_to_callsign
 
 # Optional IC-R8600 support
 try:
@@ -72,7 +73,8 @@ AUDIO_SAMPLE_RATE = 48000  # Output audio sample rate
 # WBFM settings (FM Broadcast)
 WBFM_DEVIATION = 75000   # ±75 kHz deviation
 WBFM_DEEMPHASIS = 75e-6  # 75µs de-emphasis (US standard)
-FM_BROADCAST_STEP = 100e3   # 100 kHz step for FM broadcast
+FM_BROADCAST_STEP = 200e3   # 200 kHz button step for FM broadcast (NA channel spacing)
+FM_BROADCAST_SNAP = 100e3   # 100 kHz click-to-tune snap (all valid FM channels)
 FM_BROADCAST_DEFAULT = 89.9e6  # Default FM broadcast frequency
 FM_BROADCAST_SAMPLE_RATE = 1250000  # 1.25 MHz for wider spectrum view (decimated for audio)
 
@@ -463,6 +465,11 @@ class WBFMStereoDemodulator:
         return self.stereo_decoder.peak_amplitude
 
     @property
+    def last_baseband(self):
+        """Returns the last FM baseband signal for RDS processing."""
+        return self.stereo_decoder.last_baseband
+
+    @property
     def rate_adjust(self):
         return self.stereo_decoder.rate_adjust
 
@@ -733,6 +740,7 @@ class DataThread(QThread):
         self.demodulator = None
         self.demod_enabled = False
         self.last_squelch_state = False
+        self.rds_thread = None  # Set externally for FM broadcast RDS feeding
 
     def set_demodulator(self, demodulator):
         """Set the NBFM demodulator instance."""
@@ -761,6 +769,11 @@ class DataThread(QThread):
                     audio = self.demodulator.process(iq_data)
                     if audio is not None:
                         self.audio_ready.emit(audio)
+
+                        # Feed baseband to RDS thread (only when not squelched)
+                        rds = self.rds_thread
+                        if rds and hasattr(self.demodulator, 'last_baseband'):
+                            rds.feed(self.demodulator.last_baseband)
 
                     # Emit squelch status changes
                     if self.demodulator.squelch_open != self.last_squelch_state:
@@ -792,6 +805,74 @@ class DataThread(QThread):
         """Stop the acquisition thread."""
         self.running = False
         self.wait(1000)  # Wait up to 1 second for thread to finish
+
+
+class RDSThread(QThread):
+    """Dedicated thread for RDS decoding, isolated from the I/Q and audio pipelines.
+
+    Receives baseband samples via feed() and processes them through an RDSDecoder.
+    Emits rds_update with the decoded result dict at a throttled rate (~5 Hz).
+    """
+
+    rds_update = pyqtSignal(dict)  # Emits decoded RDS fields
+
+    UPDATE_INTERVAL = 0.2  # Emit updates at ~5 Hz
+
+    def __init__(self, sample_rate, parent=None):
+        super().__init__(parent)
+        self.decoder = RDSDecoder(sample_rate=sample_rate)
+        self.running = False
+        self._lock = threading.Lock()
+        self._pending = []  # Buffered baseband chunks
+        self._event = threading.Event()
+        self._last_emit = 0.0
+
+    def feed(self, baseband):
+        """Queue baseband samples for RDS processing (called from DataThread context)."""
+        if baseband is None:
+            return
+        with self._lock:
+            self._pending.append(baseband)
+        self._event.set()
+
+    def reset(self):
+        """Reset the RDS decoder (call when tuning changes)."""
+        with self._lock:
+            self._pending.clear()
+        self.decoder.reset()
+
+    def run(self):
+        """Process queued baseband samples and emit RDS updates."""
+        self.running = True
+        while self.running:
+            # Wait for data or periodic wakeup
+            self._event.wait(timeout=0.1)
+            self._event.clear()
+
+            # Drain pending samples
+            with self._lock:
+                chunks = self._pending
+                self._pending = []
+
+            if not chunks:
+                continue
+
+            # Process all queued chunks
+            result = None
+            for chunk in chunks:
+                result = self.decoder.process(chunk)
+
+            # Throttle UI updates
+            now = time.time()
+            if result and now - self._last_emit >= self.UPDATE_INTERVAL:
+                self.rds_update.emit(result)
+                self._last_emit = now
+
+    def stop(self):
+        """Stop the RDS thread."""
+        self.running = False
+        self._event.set()  # Wake up if waiting
+        self.wait(1000)
 
 
 class SpectrumWidget(pg.PlotWidget):
@@ -1380,6 +1461,7 @@ class MainWindow(QMainWindow):
         self.wbfm_demodulator = None
         self.demodulator = None  # Currently active demodulator
         self.audio_output = None
+        self.rds_thread = None
         self.tuned_freq = center_freq  # Currently tuned frequency for demod
 
         # PI rate controller for audio clock drift compensation.
@@ -1460,6 +1542,46 @@ class MainWindow(QMainWindow):
         self.mode_button_group.buttonClicked.connect(self.on_mode_changed)
         control_layout.addWidget(self.weather_radio_btn)
         control_layout.addWidget(self.fm_broadcast_btn)
+
+        # RDS info labels (visible only in FM Broadcast mode)
+        # Spacer to separate from FM Broadcast radio button
+        self.rds_spacer = QLabel('')
+        self.rds_spacer.setFixedWidth(64)  # ~8 characters of spacing
+        control_layout.addWidget(self.rds_spacer)
+
+        self.rds_callsign_label = QLabel('')
+        self.rds_callsign_label.setStyleSheet(
+            'font-family: "Menlo", monospace; font-weight: bold; color: #00ff00;'
+        )
+        self.rds_callsign_label.setFixedWidth(48)  # 4-char callsign + padding
+        control_layout.addWidget(self.rds_callsign_label)
+
+        self.rds_station_label = QLabel('')
+        self.rds_station_label.setStyleSheet(
+            'font-family: "Menlo", monospace; font-weight: bold; color: #00ff00;'
+        )
+        self.rds_station_label.setFixedWidth(72)  # 8-char PS name
+        control_layout.addWidget(self.rds_station_label)
+
+        self.rds_pty_label = QLabel('')
+        self.rds_pty_label.setStyleSheet(
+            'font-family: "Menlo", monospace; color: #ffcc00;'
+        )
+        control_layout.addWidget(self.rds_pty_label)
+
+        self.rds_rt_label = QLabel('')
+        self.rds_rt_label.setStyleSheet(
+            'font-family: "Menlo", monospace; color: #cccccc;'
+        )
+        self.rds_rt_label.setMaximumWidth(280)  # ~32 monospace characters
+        control_layout.addWidget(self.rds_rt_label)
+
+        # Initially hidden (shown in FM Broadcast mode)
+        self.rds_spacer.hide()
+        self.rds_callsign_label.hide()
+        self.rds_station_label.hide()
+        self.rds_pty_label.hide()
+        self.rds_rt_label.hide()
 
         control_layout.addStretch()
 
@@ -1677,6 +1799,12 @@ class MainWindow(QMainWindow):
             self.stereo_indicator.show()
             self.snr_label.show()
             self.snr_indicator.show()
+            # Show RDS labels
+            self.rds_spacer.show()
+            self.rds_callsign_label.show()
+            self.rds_station_label.show()
+            self.rds_pty_label.show()
+            self.rds_rt_label.show()
             # Set spectrum range for FM broadcast
             self.spectrum_widget.set_db_range(-120, -55)
         else:
@@ -1694,6 +1822,12 @@ class MainWindow(QMainWindow):
             self.stereo_indicator.hide()
             self.snr_label.hide()
             self.snr_indicator.hide()
+            # Hide RDS labels
+            self.rds_spacer.hide()
+            self.rds_callsign_label.hide()
+            self.rds_station_label.hide()
+            self.rds_pty_label.hide()
+            self.rds_rt_label.hide()
             # Set spectrum range for weather radio
             self.spectrum_widget.set_db_range(-120, -75)
 
@@ -1813,6 +1947,11 @@ class MainWindow(QMainWindow):
             # Set active demodulator based on mode
             self.demodulator = self.nbfm_demodulator if self.current_mode == self.MODE_WEATHER else self.wbfm_demodulator
 
+            # Initialize RDS decoder thread (uses WBFM decimated rate)
+            self.rds_thread = RDSThread(sample_rate=self.wbfm_demodulator.decimated_rate)
+            self.rds_thread.rds_update.connect(self.on_rds_update)
+            self.rds_thread.start()
+
             # Initialize audio output with initial volume from slider
             # Use mono for NBFM, stereo for WBFM
             channels = 2 if self.current_mode == self.MODE_FM_BROADCAST else 1
@@ -1822,6 +1961,8 @@ class MainWindow(QMainWindow):
             # Start data acquisition thread
             self.data_thread = DataThread(self.device)
             self.data_thread.set_demodulator(self.demodulator)
+            if self.current_mode == self.MODE_FM_BROADCAST:
+                self.data_thread.rds_thread = self.rds_thread
             self.data_thread.data_ready.connect(self.process_iq_data)
             self.data_thread.audio_ready.connect(self.on_audio_ready)
             self.data_thread.squelch_status.connect(self.on_squelch_status)
@@ -1929,6 +2070,42 @@ class MainWindow(QMainWindow):
         self.snr_indicator.setText(f'{snr:2.0f} dB')
         self.snr_indicator.setStyleSheet('font-family: "Menlo", monospace; color: white;')
 
+    def _reset_rds(self):
+        """Reset RDS decoder and clear display (call when tuning changes)."""
+        if self.rds_thread:
+            self.rds_thread.reset()
+        self._clear_rds_labels()
+
+    def _clear_rds_labels(self):
+        """Clear all RDS display labels."""
+        self.rds_callsign_label.setText('')
+        self.rds_station_label.setText('')
+        self.rds_pty_label.setText('')
+        self.rds_rt_label.setText('')
+
+    def on_rds_update(self, rds_data):
+        """Handle RDS update signal from RDS thread (runs on main/Qt thread)."""
+        station = rds_data.get('station_name')
+        pty = rds_data.get('program_type')
+        rt = rds_data.get('radio_text')
+        pi_hex = rds_data.get('pi_hex')
+
+        # Callsign from PI code (fixed-width, independent of PS name)
+        if pi_hex:
+            callsign = pi_to_callsign(pi_hex)
+            if callsign:
+                self.rds_callsign_label.setText(callsign)
+
+        # 8-char PS station name (fixed-width field)
+        if station:
+            self.rds_station_label.setText(station.strip())
+
+        if pty:
+            self.rds_pty_label.setText(pty)
+
+        if rt:
+            self.rds_rt_label.setText(rt[:32])
+
     def _update_peak_meter(self):
         """Update peak meter with audio peak level from demodulator."""
         if self.demodulator is None:
@@ -2007,6 +2184,7 @@ class MainWindow(QMainWindow):
                 offset = self.tuned_freq - freq
                 self.demodulator.set_tuned_offset(offset)
                 self.demodulator.reset()
+                self._reset_rds()
 
             # Update UI
             self.freq_entry.setText(f'{freq/1e6:.3f}')
@@ -2032,6 +2210,7 @@ class MainWindow(QMainWindow):
             if self.demodulator:
                 self.demodulator.set_tuned_offset(0)
                 self.demodulator.reset()
+                self._reset_rds()
         except ValueError:
             pass
 
@@ -2113,6 +2292,16 @@ class MainWindow(QMainWindow):
             self.stereo_indicator.show()
             self.snr_label.show()
             self.snr_indicator.show()
+            # Show RDS labels and enable RDS feeding
+            self.rds_spacer.show()
+            self.rds_callsign_label.show()
+            self.rds_station_label.show()
+            self.rds_pty_label.show()
+            self.rds_rt_label.show()
+            if self.rds_thread:
+                self.rds_thread.reset()
+            if self.data_thread:
+                self.data_thread.rds_thread = self.rds_thread
             # Adjust spectrum range for stronger FM broadcast signals
             self.spectrum_widget.set_db_range(-120, -55)
         else:
@@ -2126,6 +2315,15 @@ class MainWindow(QMainWindow):
             self.stereo_indicator.hide()
             self.snr_label.hide()
             self.snr_indicator.hide()
+            # Hide RDS labels and disable RDS feeding
+            self.rds_spacer.hide()
+            self.rds_callsign_label.hide()
+            self.rds_station_label.hide()
+            self.rds_pty_label.hide()
+            self.rds_rt_label.hide()
+            self._clear_rds_labels()
+            if self.data_thread:
+                self.data_thread.rds_thread = None
             # Restore spectrum range for weaker weather radio signals
             self.spectrum_widget.set_db_range(-120, -75)
 
@@ -2148,6 +2346,7 @@ class MainWindow(QMainWindow):
         self.demodulator.set_squelch(self.squelch_slider.value())
         self.demodulator.set_tuned_offset(0)
         self.demodulator.reset()
+        self._reset_rds()
 
         # Update data thread with new demodulator and resume
         if self.data_thread:
@@ -2185,8 +2384,8 @@ class MainWindow(QMainWindow):
 
     def on_tuning_clicked(self, freq_hz):
         """Handle click-to-tune on spectrum or waterfall."""
-        # Snap to channel spacing based on mode
-        snap = self.get_freq_step()
+        # Snap to channel grid based on mode (finer than button step for FM)
+        snap = FM_BROADCAST_SNAP if self.current_mode == self.MODE_FM_BROADCAST else FREQ_STEP
         freq_hz = round(freq_hz / snap) * snap
         self.tuned_freq = freq_hz
 
@@ -2202,6 +2401,7 @@ class MainWindow(QMainWindow):
             offset = freq_hz - self.center_freq
             self.demodulator.set_tuned_offset(offset)
             self.demodulator.reset()  # Reset filter states for clean transition
+            self._reset_rds()
 
     def on_audio_ready(self, audio_samples):
         """Handle demodulated audio from data thread."""
@@ -2274,6 +2474,9 @@ class MainWindow(QMainWindow):
         # Stop audio output
         if self.audio_output:
             self.audio_output.stop()
+
+        if self.rds_thread:
+            self.rds_thread.stop()
 
         if self.data_thread:
             self.data_thread.stop()
