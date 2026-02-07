@@ -1594,17 +1594,11 @@ class MainWindow(QMainWindow):
         self.rds_callsign_label.setFixedWidth(48)  # 4-char callsign + padding
         control_layout.addWidget(self.rds_callsign_label)
 
-        self.rds_station_label = QLabel('')
-        self.rds_station_label.setStyleSheet(
-            'font-family: "Menlo", monospace; font-weight: bold; color: #00ff00;'
-        )
-        self.rds_station_label.setFixedWidth(72)  # 8-char PS name
-        control_layout.addWidget(self.rds_station_label)
-
         self.rds_pty_label = QLabel('')
         self.rds_pty_label.setStyleSheet(
             'font-family: "Menlo", monospace; color: #ffcc00;'
         )
+        self.rds_pty_label.setFixedWidth(104)  # 11-char PTY field + padding
         control_layout.addWidget(self.rds_pty_label)
 
         self.rds_rt_label = QLabel('')
@@ -1617,7 +1611,6 @@ class MainWindow(QMainWindow):
         # Initially hidden (shown in FM Broadcast mode)
         self.rds_spacer.hide()
         self.rds_callsign_label.hide()
-        self.rds_station_label.hide()
         self.rds_pty_label.hide()
         self.rds_rt_label.hide()
 
@@ -1840,7 +1833,6 @@ class MainWindow(QMainWindow):
             # Show RDS labels
             self.rds_spacer.show()
             self.rds_callsign_label.show()
-            self.rds_station_label.show()
             self.rds_pty_label.show()
             self.rds_rt_label.show()
             # Set spectrum range for FM broadcast
@@ -1863,7 +1855,6 @@ class MainWindow(QMainWindow):
             # Hide RDS labels
             self.rds_spacer.hide()
             self.rds_callsign_label.hide()
-            self.rds_station_label.hide()
             self.rds_pty_label.hide()
             self.rds_rt_label.hide()
             # Set spectrum range for weather radio
@@ -2121,13 +2112,11 @@ class MainWindow(QMainWindow):
     def _clear_rds_labels(self):
         """Clear all RDS display labels."""
         self.rds_callsign_label.setText('')
-        self.rds_station_label.setText('')
         self.rds_pty_label.setText('')
         self.rds_rt_label.setText('')
 
     def on_rds_update(self, rds_data):
         """Handle RDS update signal from RDS thread (runs on main/Qt thread)."""
-        station = rds_data.get('station_name')
         pty = rds_data.get('program_type')
         rt = rds_data.get('radio_text')
         pi_hex = rds_data.get('pi_hex')
@@ -2138,12 +2127,8 @@ class MainWindow(QMainWindow):
             if callsign:
                 self.rds_callsign_label.setText(callsign)
 
-        # 8-char PS station name (fixed-width field)
-        if station:
-            self.rds_station_label.setText(station.strip())
-
         if pty:
-            self.rds_pty_label.setText(pty)
+            self.rds_pty_label.setText(f'{pty[:11]:<11}')
 
         if rt:
             self.rds_rt_label.setText(rt[:32])
@@ -2337,7 +2322,6 @@ class MainWindow(QMainWindow):
             # Show RDS labels and enable RDS feeding
             self.rds_spacer.show()
             self.rds_callsign_label.show()
-            self.rds_station_label.show()
             self.rds_pty_label.show()
             self.rds_rt_label.show()
             if self.rds_thread:
@@ -2360,7 +2344,6 @@ class MainWindow(QMainWindow):
             # Hide RDS labels and disable RDS feeding
             self.rds_spacer.hide()
             self.rds_callsign_label.hide()
-            self.rds_station_label.hide()
             self.rds_pty_label.hide()
             self.rds_rt_label.hide()
             self._clear_rds_labels()
